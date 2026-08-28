@@ -99,8 +99,14 @@ kafka-receiver = [
     "dep:tokio-util",
 ]
 oracle-receiver = [
+    "dep:base64",
+    "dep:chrono",
     "dep:oracle",
     "dep:humantime-serde",
+    "dep:rand",
+    "dep:secrecy",
+    "dep:tokio-util",
+    "dep:urlencoding",
 ]
 kafka-exporter = [
     "dep:rdkafka",

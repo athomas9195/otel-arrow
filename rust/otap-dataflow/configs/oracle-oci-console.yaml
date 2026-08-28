@@ -13,13 +13,40 @@ groups:
           oracle:
             type: urn:otel:receiver:oracle
             config:
-              connect_string: //localhost:1521/FREEPDB1
-              username: PDBADMIN
-              password_env: ORACLE_PWD
-              query: SELECT SYSDATE AS CURRENT_TIME FROM DUAL
-              poll_interval: 30s
-              call_timeout: 10s
-              max_rows: 100
+              database:
+                connect_string: //localhost:1521/FREEPDB1
+                username: PDBADMIN
+                password_env: ORACLE_PWD
+                pool:
+                  min_connections: 1
+                  max_connections: 1
+                  max_connection_lifetime: 1h
+                tls:
+                  mode: disabled
+              limits:
+                max_concurrent_queries: 1
+                max_batch_rows: 100
+                max_batch_bytes: 1 MiB
+                max_in_flight_bytes: 1 MiB
+                fetch_size: 100
+              scheduling:
+                startup_jitter_max: 5s
+              retry:
+                enabled: true
+                initial_backoff: 1s
+                multiplier: 2
+              resource_attributes:
+                service.name: oracle-database
+              queries:
+                current_time:
+                  sql: SELECT SYSDATE AS CURRENT_TIME FROM DUAL
+                  interval: 30s
+                  timeout: 10s
+                  pagination:
+                    max_rows: 100
+                  output:
+                    attributes:
+                      CURRENT_TIME: database.current_time
           console:
             type: exporter:console
             config: {}

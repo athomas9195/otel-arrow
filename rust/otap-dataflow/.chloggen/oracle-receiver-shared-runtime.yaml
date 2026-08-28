@@ -1,0 +1,6 @@
+change_type: breaking
+component: pipeline
+note: Refactor the Oracle receiver to support bounded, independently scheduled queries through a shared database polling runtime.
+issues: []
+subtext: |
+  Migration: Move Oracle connection settings under database and replace query, poll_interval, call_timeout, and max_rows with named entries under queries.

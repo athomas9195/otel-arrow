@@ -13,13 +13,9 @@ pub mod kafka_receiver;
 #[cfg(feature = "oracle-receiver")]
 pub mod oracle_receiver;
 
-/// Shared polling lifecycle for scraper-style receivers.
+/// Shared database polling runtime and database-neutral contracts.
 #[cfg(feature = "oracle-receiver")]
-mod scraper;
-
-/// Narrow database boundary for SQL polling receivers.
-#[cfg(feature = "oracle-receiver")]
-mod sql_polling;
+mod database;
 
 /// Linux user_events receiver.
 #[cfg(all(feature = "user_events-receiver", target_os = "linux"))]
