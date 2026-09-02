@@ -1,0 +1,52 @@
+# Oracle receiver benchmark with exactly one receiver node on one engine core.
+name: Oracle Receiver - Single Poller
+components:
+  df-engine:
+    deployment:
+      docker:
+        image: df_engine_oracle_benchmark:latest
+        network: testbed
+        cpuset_cpus: "0"
+        ports:
+          - "127.0.0.1:8086:8080"
+        environment:
+          ORACLE_CONNECT_STRING: //oracle-vm-1:1521/ORCLPDB1
+        volumes:
+          - >-
+            test_suites/integration/configs/oracle/config.rendered.yaml:/app/config.yaml:ro
+          - >-
+            test_suites/integration/configs/oracle/secrets:/run/oracle-secrets:ro
+          - >-
+            test_suites/integration/configs/oracle/checkpoints:/var/lib/otel-arrow/oracle:rw
+        command:
+          - "--config"
+          - "/app/config.yaml"
+          - "--core-id-range"
+          - "0-0"
+          - "--http-admin-bind"
+          - "0.0.0.0:8080"
+    monitoring:
+      docker_component:
+        allocated_cores: 1
+        interval: 1
+      prometheus:
+        endpoint: >-
+          http://localhost:8086/api/v1/telemetry/metrics?format=prometheus&reset=false
+        interval: 1
+
+tests:
+  - name: Oracle composite watermark backlog
+    from_template:
+      path: >-
+        test_suites/integration/templates/test_steps/oracle-single-poller-steps-docker.yaml
+      variables:
+        result_dir: oracle_single_poller
+        warmup_interval: 10
+        observation_interval: 60
+        drain_timeout_secs: 60
+        poll_interval: 1ms
+        fetch_size: 10000
+        max_rows_per_poll: 10000
+        max_batch_bytes: 64 MiB
+        max_normalized_bytes: 64 MiB
+        query_timeout: 2m
