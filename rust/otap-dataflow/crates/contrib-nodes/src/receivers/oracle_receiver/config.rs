@@ -1,359 +1,310 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration and validation for the Oracle polling receiver.
+//! Oracle receiver configuration.
+//!
+//! The customer supplies the complete SQL statement. This module validates that
+//! the statement is a single read-only `SELECT`, references both configured
+//! named binds as real bind markers, and ends with the required outer
+//! `ORDER BY <timestamp> ASC, <tie_breaker> ASC`. String literals, comments,
+//! bind-name prefixes, and orderings nested inside parentheses never satisfy
+//! that requirement.
 
-use crate::receivers::sql_polling::CompoundWatermark;
-use oracle::sql_type::Timestamp;
+use super::adapter::{OracleAdapter, OracleAdapterConfig};
+use crate::receivers::database::{
+    CheckpointConfig, CompiledQuery, OutputConfig, PollingConfig, QueryError, WatermarkConfig,
+};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::path::{Component, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-const DEFAULT_PASSWORD_ENV: &str = "ORACLE_PWD";
-const DEFAULT_MAX_ROWS: usize = 100;
-const MAX_ROWS_LIMIT: usize = 1_000;
-const DEFAULT_MAX_BATCH_BYTES: u64 = 1024 * 1024;
-const MAX_BATCH_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_POLL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_NACK_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_NACK_BACKOFF: Duration = Duration::from_secs(60 * 60);
-const DEFAULT_CHECKPOINT_DIR: &str = "${engine.state_dir}/oracle";
-const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 5;
-const MAX_CONSECUTIVE_FAILURES_LIMIT: u32 = 100;
-const MAX_QUERY_BYTES: usize = 64 * 1024;
+const MAX_SOURCE_ID_BYTES: usize = 256;
+const MIN_ORACLE_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_ORACLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-fn default_password_env() -> String {
-    DEFAULT_PASSWORD_ENV.to_owned()
+/// Validated configuration for one Oracle composite-watermark query.
+#[derive(Deserialize)]
+#[serde(try_from = "RawOracleConfig")]
+pub struct OracleReceiverConfig {
+    source_id: String,
+    connection: OracleConnectionConfig,
+    authentication: OracleAuthenticationConfig,
+    query: OracleQueryConfig,
+    watermark: WatermarkConfig,
+    checkpoint: CheckpointConfig,
+    config_fingerprint: String,
 }
 
-const fn default_max_rows() -> usize {
-    DEFAULT_MAX_ROWS
-}
+impl OracleReceiverConfig {
+    /// Returns the stable source identifier attached to every emitted row.
+    #[must_use]
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
 
-const fn default_max_batch_bytes() -> u64 {
-    DEFAULT_MAX_BATCH_BYTES
-}
+    /// Returns the durable checkpoint policy.
+    #[must_use]
+    pub const fn checkpoint(&self) -> &CheckpointConfig {
+        &self.checkpoint
+    }
 
-const fn default_poll_interval() -> Duration {
-    DEFAULT_POLL_INTERVAL
-}
+    /// Returns a stable fingerprint of the semantic configuration.
+    ///
+    /// Credentials and mounted secret paths are excluded, so rotating a secret
+    /// does not invalidate an existing durable checkpoint.
+    #[must_use]
+    pub fn config_fingerprint(&self) -> &str {
+        &self.config_fingerprint
+    }
 
-const fn default_call_timeout() -> Duration {
-    DEFAULT_CALL_TIMEOUT
-}
+    /// Compiles the shared query plan.
+    pub fn compile(&self) -> Result<CompiledQuery, QueryError> {
+        CompiledQuery::compile(
+            self.query.statement.clone(),
+            self.query.polling(),
+            &self.watermark,
+            &self.checkpoint,
+            OutputConfig {
+                // Composite mode derives OTLP event time from the cursor
+                // timestamp and validates the tie-breaker column exists.
+                timestamp_column: Some(self.watermark.timestamp().column.clone()),
+                validation_columns: vec![self.watermark.tie_breaker().column.clone()],
+                ..OutputConfig::default()
+            },
+        )
+    }
 
-const fn default_nack_backoff() -> Duration {
-    DEFAULT_NACK_BACKOFF
-}
-
-fn default_checkpoint_directory() -> PathBuf {
-    PathBuf::from(DEFAULT_CHECKPOINT_DIR)
-}
-
-const fn default_max_consecutive_failures() -> u32 {
-    DEFAULT_MAX_CONSECUTIVE_FAILURES
-}
-
-/// Timestamp half of the ascending compound watermark.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct TimestampWatermarkConfig {
-    /// Selected Oracle timestamp column.
-    pub(super) column: String,
-    /// Named Oracle bind without the leading colon.
-    pub(super) bind: String,
-    /// Explicit initial Oracle timestamp.
-    pub(super) initial: String,
-}
-
-/// Integer half of the ascending compound watermark.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct TieBreakerWatermarkConfig {
-    /// Selected signed 64-bit integer column.
-    pub(super) column: String,
-    /// Named Oracle bind without the leading colon.
-    pub(super) bind: String,
-    /// Explicit initial signed 64-bit integer.
-    pub(super) initial: i64,
-}
-
-/// Compound watermark configuration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct WatermarkConfig {
-    /// Timestamp component.
-    pub(super) timestamp: TimestampWatermarkConfig,
-    /// Unique integer component for timestamp collisions.
-    pub(super) tie_breaker: TieBreakerWatermarkConfig,
-}
-
-/// Durable checkpoint configuration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CheckpointConfig {
-    /// Root directory. A stable pipeline/source suffix is appended.
-    #[serde(default = "default_checkpoint_directory")]
-    pub(super) directory: PathBuf,
-    /// Consecutive durable write failures allowed before the receiver fails.
-    #[serde(default = "default_max_consecutive_failures")]
-    pub(super) max_consecutive_failures: u32,
-}
-
-impl Default for CheckpointConfig {
-    fn default() -> Self {
-        Self {
-            directory: default_checkpoint_directory(),
-            max_consecutive_failures: default_max_consecutive_failures(),
-        }
+    /// Builds the Oracle adapter for this configuration.
+    #[must_use]
+    pub fn adapter(&self) -> OracleAdapter {
+        OracleAdapter::new(OracleAdapterConfig {
+            connect_string: self.connection.connect_string.clone(),
+            instant_client_dir: self.connection.instant_client_dir.clone(),
+            username_file: self.authentication.username_file.clone(),
+            password_file: self.authentication.password_file.clone(),
+        })
     }
 }
 
-/// User-facing Oracle receiver configuration.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Config {
-    pub(super) source_id: String,
-    pub(super) connect_string: String,
-    pub(super) username: String,
-    #[serde(default = "default_password_env")]
-    pub(super) password_env: String,
-    pub(super) query: String,
-    pub(super) watermark: WatermarkConfig,
-    #[serde(default)]
-    pub(super) checkpoint: CheckpointConfig,
-    #[serde(default = "default_nack_backoff", with = "humantime_serde")]
-    pub(super) nack_backoff: Duration,
-    #[serde(default = "default_poll_interval", with = "humantime_serde")]
-    pub(super) poll_interval: Duration,
-    #[serde(default = "default_call_timeout", with = "humantime_serde")]
-    pub(super) call_timeout: Duration,
-    #[serde(default = "default_max_rows")]
-    pub(super) max_rows: usize,
-    #[serde(
-        default = "default_max_batch_bytes",
-        deserialize_with = "deserialize_byte_size"
-    )]
-    pub(super) max_batch_bytes: u64,
-}
+impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
+    type Error = OracleConfigError;
 
-/// Validated runtime configuration.
-#[derive(Clone, Debug)]
-pub(super) struct RuntimeConfig {
-    pub(super) source_id: String,
-    pub(super) connect_string: String,
-    pub(super) username: String,
-    pub(super) password_env: String,
-    pub(super) query: String,
-    pub(super) watermark: WatermarkConfig,
-    pub(super) initial_watermark: CompoundWatermark,
-    pub(super) checkpoint: CheckpointConfig,
-    pub(super) nack_backoff: Duration,
-    pub(super) poll_interval: Duration,
-    pub(super) call_timeout: Duration,
-    pub(super) max_rows: usize,
-    pub(super) max_batch_bytes: u64,
-    pub(super) config_fingerprint: String,
-}
-
-impl TryFrom<Config> for RuntimeConfig {
-    type Error = String;
-
-    fn try_from(config: Config) -> Result<Self, Self::Error> {
-        let source_id = validate_source_id(config.source_id)?;
-        let connect_string = required_text("connect_string", config.connect_string)?;
-        let username = required_text("username", config.username)?;
-        let password_env = validate_env_name(config.password_env)?;
-        let query = validate_query(config.query, &config.watermark)?;
-        let watermark = validate_watermark(config.watermark)?;
-        let initial_timestamp = Timestamp::from_str(&watermark.timestamp.initial)
-            .map_err(|error| format!("watermark.timestamp.initial is invalid: {error}"))?
-            .to_string();
-        let initial_watermark = CompoundWatermark {
-            timestamp: initial_timestamp,
-            tie_breaker: watermark.tie_breaker.initial,
-        };
-        validate_checkpoint(&config.checkpoint)?;
-        validate_duration("poll_interval", config.poll_interval, MAX_POLL_INTERVAL)?;
-        validate_duration("call_timeout", config.call_timeout, MAX_CALL_TIMEOUT)?;
-        validate_duration("nack_backoff", config.nack_backoff, MAX_NACK_BACKOFF)?;
-        if !(1..=MAX_ROWS_LIMIT).contains(&config.max_rows) {
-            return Err(format!("max_rows must be between 1 and {MAX_ROWS_LIMIT}"));
+    fn try_from(config: RawOracleConfig) -> Result<Self, Self::Error> {
+        required("source_id", &config.source_id)?;
+        if config.source_id.len() > MAX_SOURCE_ID_BYTES {
+            return Err(OracleConfigError::new(format!(
+                "source_id must not exceed {MAX_SOURCE_ID_BYTES} bytes"
+            )));
         }
-        if !(1..=MAX_BATCH_BYTES_LIMIT).contains(&config.max_batch_bytes) {
-            return Err(format!(
-                "max_batch_bytes must be between 1 and {MAX_BATCH_BYTES_LIMIT}"
+        required(
+            "connection.connect_string",
+            &config.connection.connect_string,
+        )?;
+        required(
+            "connection.instant_client_dir",
+            &config.connection.instant_client_dir,
+        )?;
+        required(
+            "authentication.username_file",
+            &config.authentication.username_file,
+        )?;
+        required(
+            "authentication.password_file",
+            &config.authentication.password_file,
+        )?;
+        required("query.statement", &config.query.statement)?;
+        if !(MIN_ORACLE_TIMEOUT..=MAX_ORACLE_TIMEOUT).contains(&config.query.timeout) {
+            return Err(OracleConfigError::new(
+                "query.timeout must be between 1ms and 5m",
             ));
         }
+        config.query.polling().validate()?;
+        config.watermark.validate()?;
+        config.checkpoint.validate()?;
+        validate_oracle_identifier(
+            "watermark.timestamp.column",
+            &config.watermark.timestamp().column,
+        )?;
+        validate_oracle_identifier(
+            "watermark.tie_breaker.column",
+            &config.watermark.tie_breaker().column,
+        )?;
+        _ = oracle::sql_type::Timestamp::from_str(&config.watermark.timestamp().initial).map_err(
+            |error| {
+                OracleConfigError::new(format!(
+                    "watermark.timestamp.initial is not a valid Oracle timestamp: {error}"
+                ))
+            },
+        )?;
+        let statement = validate_statement(&config.query.statement, &config.watermark)?;
 
         let fingerprint = FingerprintInput {
-            source_id: &source_id,
-            connect_string: &connect_string,
-            username: &username,
-            query: &query,
-            watermark: &watermark,
+            source_id: &config.source_id,
+            connect_string: &config.connection.connect_string,
+            statement: &statement,
+            timestamp_column: &config.watermark.timestamp().column,
+            timestamp_bind: &config.watermark.timestamp().bind,
+            timestamp_initial: &config.watermark.timestamp().initial,
+            tie_breaker_column: &config.watermark.tie_breaker().column,
+            tie_breaker_bind: &config.watermark.tie_breaker().bind,
+            tie_breaker_initial: config.watermark.tie_breaker().initial,
         };
-        let fingerprint_bytes = serde_json::to_vec(&fingerprint)
-            .map_err(|error| format!("failed to fingerprint Oracle configuration: {error}"))?;
+        let fingerprint_bytes = serde_json::to_vec(&fingerprint).map_err(|error| {
+            OracleConfigError::new(format!(
+                "failed to fingerprint Oracle configuration: {error}"
+            ))
+        })?;
         let config_fingerprint = blake3::hash(&fingerprint_bytes).to_hex().to_string();
 
         Ok(Self {
-            source_id,
-            connect_string,
-            username,
-            password_env,
-            query,
-            watermark,
-            initial_watermark,
+            source_id: config.source_id,
+            connection: config.connection,
+            authentication: config.authentication,
+            query: OracleQueryConfig {
+                statement,
+                ..config.query
+            },
+            watermark: config.watermark,
             checkpoint: config.checkpoint,
-            nack_backoff: config.nack_backoff,
-            poll_interval: config.poll_interval,
-            call_timeout: config.call_timeout,
-            max_rows: config.max_rows,
-            max_batch_bytes: config.max_batch_bytes,
             config_fingerprint,
         })
     }
 }
 
+/// Semantic fields identifying one checkpoint stream.
+///
+/// Credential file paths and the Instant Client directory are excluded so
+/// rotating a mounted secret cannot invalidate durable state.
 #[derive(Serialize)]
 struct FingerprintInput<'a> {
     source_id: &'a str,
     connect_string: &'a str,
-    username: &'a str,
-    query: &'a str,
-    watermark: &'a WatermarkConfig,
+    statement: &'a str,
+    timestamp_column: &'a str,
+    timestamp_bind: &'a str,
+    timestamp_initial: &'a str,
+    tie_breaker_column: &'a str,
+    tie_breaker_bind: &'a str,
+    tie_breaker_initial: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOracleConfig {
+    source_id: String,
+    connection: OracleConnectionConfig,
+    authentication: OracleAuthenticationConfig,
+    query: OracleQueryConfig,
+    watermark: WatermarkConfig,
+    checkpoint: CheckpointConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleConnectionConfig {
+    connect_string: String,
+    instant_client_dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleAuthenticationConfig {
+    username_file: String,
+    password_file: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleQueryConfig {
+    statement: String,
+    #[serde(with = "humantime_serde")]
+    interval: Duration,
+    fetch_size: usize,
+    max_rows_per_poll: usize,
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    max_batch_bytes: u64,
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    max_normalized_bytes: u64,
+    #[serde(with = "humantime_serde")]
+    timeout: Duration,
+}
+
+impl OracleQueryConfig {
+    fn polling(&self) -> PollingConfig {
+        PollingConfig {
+            interval: self.interval,
+            timeout: self.timeout,
+            fetch_size: self.fetch_size,
+            max_rows_per_poll: self.max_rows_per_poll,
+            max_batch_bytes: self.max_batch_bytes,
+            max_normalized_bytes: self.max_normalized_bytes,
+        }
+    }
 }
 
 fn deserialize_byte_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
-    otap_df_config::byte_units::deserialize_u64(deserializer)?
+    otel_arrow_dfe_config::byte_units::deserialize_u64(deserializer)?
         .ok_or_else(|| DeError::custom("byte size must not be null"))
 }
 
-fn required_text(name: &str, value: String) -> Result<String, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        Err(format!("{name} must not be empty"))
-    } else {
-        Ok(value.to_owned())
-    }
-}
-
-fn validate_source_id(source_id: String) -> Result<String, String> {
-    let source_id = required_text("source_id", source_id)?;
-    if !source_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return Err("source_id must contain only ASCII alphanumerics, '_', '-', or '.'".to_owned());
-    }
-    Ok(source_id)
-}
-
-fn validate_env_name(value: String) -> Result<String, String> {
-    let value = required_text("password_env", value)?;
-    let mut bytes = value.bytes();
-    let Some(first) = bytes.next() else {
-        return Err("password_env must not be empty".to_owned());
-    };
-    if !(first.is_ascii_alphabetic() || first == b'_')
-        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err("password_env must be a valid environment variable name".to_owned());
-    }
-    Ok(value)
-}
-
-fn validate_watermark(mut watermark: WatermarkConfig) -> Result<WatermarkConfig, String> {
-    watermark.timestamp.column =
-        validate_oracle_identifier("watermark.timestamp.column", watermark.timestamp.column)?;
-    watermark.timestamp.bind =
-        validate_bind_name("watermark.timestamp.bind", watermark.timestamp.bind)?;
-    watermark.timestamp.initial =
-        required_text("watermark.timestamp.initial", watermark.timestamp.initial)?;
-    watermark.tie_breaker.column =
-        validate_oracle_identifier("watermark.tie_breaker.column", watermark.tie_breaker.column)?;
-    watermark.tie_breaker.bind =
-        validate_bind_name("watermark.tie_breaker.bind", watermark.tie_breaker.bind)?;
-
-    if watermark
-        .timestamp
-        .column
-        .eq_ignore_ascii_case(&watermark.tie_breaker.column)
-    {
-        return Err("watermark columns must be distinct".to_owned());
-    }
-    if watermark
-        .timestamp
-        .bind
-        .eq_ignore_ascii_case(&watermark.tie_breaker.bind)
-    {
-        return Err("watermark bind names must be distinct".to_owned());
-    }
-    Ok(watermark)
-}
-
-fn validate_oracle_identifier(name: &str, value: String) -> Result<String, String> {
-    let value = required_text(name, value)?;
-    let mut bytes = value.bytes();
-    let first = bytes.next().expect("required text checked above");
-    if !first.is_ascii_alphabetic()
-        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#'))
-    {
-        return Err(format!(
-            "{name} must be an unquoted Oracle identifier beginning with an ASCII letter"
+/// Validates the customer-authored statement's binds and final ordering.
+fn validate_statement(
+    statement: &str,
+    watermark: &WatermarkConfig,
+) -> Result<String, OracleConfigError> {
+    let trimmed = statement.trim();
+    let statement = trimmed
+        .strip_suffix(';')
+        .unwrap_or(trimmed)
+        .trim()
+        .to_owned();
+    if statement.contains(';') || statement.contains("--") || statement.contains("/*") {
+        return Err(OracleConfigError::new(
+            "query.statement must be one SELECT statement without SQL comments",
         ));
     }
-    Ok(value)
-}
-
-fn validate_bind_name(name: &str, value: String) -> Result<String, String> {
-    let value = required_text(name, value)?;
-    let mut bytes = value.bytes();
-    let first = bytes.next().expect("required text checked above");
-    if !(first.is_ascii_alphabetic() || first == b'_')
-        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    if !statement
+        .split_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("SELECT"))
     {
-        return Err(format!(
-            "{name} must omit ':' and contain only ASCII alphanumerics or '_'"
+        return Err(OracleConfigError::new(
+            "query.statement must start with SELECT",
         ));
     }
-    Ok(value)
-}
 
-fn validate_query(query: String, watermark: &WatermarkConfig) -> Result<String, String> {
-    let query = required_text("query", query)?;
-    if query.len() > MAX_QUERY_BYTES {
-        return Err(format!("query must be at most {MAX_QUERY_BYTES} bytes"));
-    }
-    let query = query.strip_suffix(';').unwrap_or(&query).trim().to_owned();
-    if query.contains(';') || query.contains("--") || query.contains("/*") {
-        return Err("query must be one SELECT/WITH statement without SQL comments".to_owned());
-    }
-    let first = query.split_whitespace().next().unwrap_or_default();
-    if !first.eq_ignore_ascii_case("SELECT") && !first.eq_ignore_ascii_case("WITH") {
-        return Err("query must start with SELECT or WITH".to_owned());
-    }
-
-    let upper = query.to_ascii_uppercase();
+    let upper = statement.to_ascii_uppercase();
     let tokens = sql_tokens(&upper)?;
-    for bind in [&watermark.timestamp.bind, &watermark.tie_breaker.bind] {
+    let timestamp = watermark.timestamp();
+    let tie_breaker = watermark.tie_breaker();
+    // Exact token equality, so ':last_ts_extra' never satisfies ':last_ts' and
+    // a bind marker inside a string literal is not a token at all.
+    for bind in [&timestamp.bind, &tie_breaker.bind] {
         let marker = format!(":{}", bind.to_ascii_uppercase());
         if !tokens.iter().any(|token| token.text == marker) {
-            return Err(format!("query must reference Oracle bind {marker}"));
+            return Err(OracleConfigError::new(format!(
+                "query.statement must reference Oracle bind {marker}"
+            )));
+        }
+    }
+    for (column, operator, bind) in [
+        (&timestamp.column, ">", &timestamp.bind),
+        (&timestamp.column, "=", &timestamp.bind),
+        (&tie_breaker.column, ">", &tie_breaker.bind),
+    ] {
+        if !contains_comparison(&tokens, column, operator, bind) {
+            return Err(OracleConfigError::new(format!(
+                "query.statement must compare {column} {operator} :{bind}"
+            )));
         }
     }
 
-    let timestamp_column = watermark.timestamp.column.to_ascii_uppercase();
-    let tie_breaker_column = watermark.tie_breaker.column.to_ascii_uppercase();
+    let timestamp_column = timestamp.column.to_ascii_uppercase();
+    let tie_breaker_column = tie_breaker.column.to_ascii_uppercase();
     let expected = [
         "ORDER",
         "BY",
@@ -363,27 +314,38 @@ fn validate_query(query: String, watermark: &WatermarkConfig) -> Result<String, 
         tie_breaker_column.as_str(),
         "ASC",
     ];
+    // Only a top-level ORDER BY orders the returned rows, so nested orderings
+    // inside a subquery cannot satisfy the paging contract.
     let last_order = tokens.windows(2).rposition(|window| {
         window[0].depth == 0
             && window[1].depth == 0
             && window[0].text == "ORDER"
             && window[1].text == "BY"
     });
-    let matching_order = last_order.is_some_and(|index| {
+    let matches_ordering = last_order.is_some_and(|index| {
         tokens[index..]
             .iter()
-            .take(expected.len())
             .filter(|token| token.depth == 0)
             .map(|token| token.text.as_str())
             .eq(expected.iter().copied())
     });
-    if !matching_order {
-        return Err(format!(
-            "query's final ORDER BY must be {} ASC, {} ASC",
-            watermark.timestamp.column, watermark.tie_breaker.column
-        ));
+    if !matches_ordering {
+        return Err(OracleConfigError::new(format!(
+            "query.statement must end with ORDER BY {} ASC, {} ASC",
+            timestamp.column, tie_breaker.column
+        )));
     }
-    Ok(query)
+
+    fn contains_comparison(tokens: &[SqlToken], column: &str, operator: &str, bind: &str) -> bool {
+        let expected_column = column.to_ascii_uppercase();
+        let expected_bind = format!(":{}", bind.to_ascii_uppercase());
+        tokens.windows(3).any(|window| {
+            window[0].text == expected_column
+                && window[1].text == operator
+                && window[2].text == expected_bind
+        })
+    }
+    Ok(statement)
 }
 
 struct SqlToken {
@@ -391,58 +353,84 @@ struct SqlToken {
     depth: usize,
 }
 
-fn sql_tokens(sql: &str) -> Result<Vec<SqlToken>, String> {
+/// Splits uppercased SQL into identifier tokens, discarding string literals.
+fn sql_tokens(sql: &str) -> Result<Vec<SqlToken>, OracleConfigError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let mut depth = 0usize;
+    let mut depth = 0_usize;
     let mut in_string = false;
     let mut characters = sql.chars().peekable();
-    while let Some(ch) = characters.next() {
+    while let Some(character) = characters.next() {
         if in_string {
-            if ch == '\'' {
+            if character == '\'' {
                 if characters.peek() == Some(&'\'') {
-                    let _ = characters.next();
+                    _ = characters.next();
                 } else {
                     in_string = false;
                 }
             }
             continue;
         }
-        if ch == '\'' {
-            push_sql_token(&mut tokens, &mut current, depth);
+        if character == '\'' {
+            push_token(&mut tokens, &mut current, depth);
             in_string = true;
             continue;
         }
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#' | ':') {
-            current.push(ch);
-        } else {
-            push_sql_token(&mut tokens, &mut current, depth);
-            match ch {
-                '(' => depth = depth.saturating_add(1),
-                ')' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or_else(|| "query contains unbalanced parentheses".to_owned())?;
-                }
-                ',' => tokens.push(SqlToken {
-                    text: ",".to_owned(),
-                    depth,
-                }),
-                _ => {}
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '$' | '#' | ':') {
+            current.push(character);
+            continue;
+        }
+        push_token(&mut tokens, &mut current, depth);
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    OracleConfigError::new("query.statement contains unbalanced parentheses")
+                })?;
             }
+            ',' => tokens.push(SqlToken {
+                text: ",".to_owned(),
+                depth,
+            }),
+            '>' | '=' => tokens.push(SqlToken {
+                text: character.to_string(),
+                depth,
+            }),
+            _ => {}
         }
     }
+
     if in_string {
-        return Err("query contains an unterminated string literal".to_owned());
+        return Err(OracleConfigError::new(
+            "query.statement contains an unterminated string literal",
+        ));
     }
     if depth != 0 {
-        return Err("query contains unbalanced parentheses".to_owned());
+        return Err(OracleConfigError::new(
+            "query.statement contains unbalanced parentheses",
+        ));
     }
-    push_sql_token(&mut tokens, &mut current, depth);
+    push_token(&mut tokens, &mut current, depth);
     Ok(tokens)
 }
 
-fn push_sql_token(tokens: &mut Vec<SqlToken>, current: &mut String, depth: usize) {
+fn validate_oracle_identifier(
+    field: &'static str,
+    identifier: &str,
+) -> Result<(), OracleConfigError> {
+    let mut bytes = identifier.bytes();
+    let first = bytes.next().unwrap_or(b'0');
+    if !first.is_ascii_alphabetic()
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#'))
+    {
+        return Err(OracleConfigError::new(format!(
+            "{field} must be an unquoted Oracle identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn push_token(tokens: &mut Vec<SqlToken>, current: &mut String, depth: usize) {
     if !current.is_empty() {
         tokens.push(SqlToken {
             text: std::mem::take(current),
@@ -451,151 +439,37 @@ fn push_sql_token(tokens: &mut Vec<SqlToken>, current: &mut String, depth: usize
     }
 }
 
-fn validate_checkpoint(checkpoint: &CheckpointConfig) -> Result<(), String> {
-    if checkpoint.directory.as_os_str().is_empty() {
-        return Err("checkpoint.directory must not be empty".to_owned());
+fn required(field: &'static str, value: &str) -> Result<(), OracleConfigError> {
+    if value.trim().is_empty() {
+        Err(OracleConfigError::new(format!("{field} must not be empty")))
+    } else {
+        Ok(())
     }
-    if checkpoint
-        .directory
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err("checkpoint.directory must not contain '..'".to_owned());
-    }
-    if !(1..=MAX_CONSECUTIVE_FAILURES_LIMIT).contains(&checkpoint.max_consecutive_failures) {
-        return Err(format!(
-            "checkpoint.max_consecutive_failures must be between 1 and {MAX_CONSECUTIVE_FAILURES_LIMIT}"
-        ));
-    }
-    Ok(())
 }
 
-fn validate_duration(name: &str, value: Duration, maximum: Duration) -> Result<(), String> {
-    if value.is_zero() {
-        return Err(format!("{name} must be greater than zero"));
-    }
-    if value > maximum {
-        return Err(format!("{name} must be <= {}s", maximum.as_secs()));
-    }
-    Ok(())
+/// Invalid Oracle receiver configuration.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct OracleConfigError {
+    message: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn valid_config() -> serde_json::Value {
-        json!({
-            "source_id": "orders",
-            "connect_string": "//localhost:1521/FREEPDB1",
-            "username": "PDBADMIN",
-            "query": "SELECT EVENT_TS, EVENT_ID, PAYLOAD FROM EVENTS WHERE (EVENT_TS > :last_ts OR (EVENT_TS = :last_ts AND EVENT_ID > :last_id)) ORDER BY EVENT_TS ASC, EVENT_ID ASC",
-            "watermark": {
-                "timestamp": {
-                    "column": "EVENT_TS",
-                    "bind": "last_ts",
-                    "initial": "2026-01-01 00:00:00.000000000"
-                },
-                "tie_breaker": {
-                    "column": "EVENT_ID",
-                    "bind": "last_id",
-                    "initial": 0
-                }
-            }
-        })
-    }
-
-    /// Scenario: a complete Oracle watermark configuration uses safe defaults.
-    /// Guarantees: the runtime has explicit initial state and bounded polling values.
-    #[test]
-    fn valid_config_builds_runtime_defaults() {
-        let config: Config = serde_json::from_value(valid_config()).expect("config");
-        let runtime = RuntimeConfig::try_from(config).expect("runtime");
-
-        assert_eq!(runtime.initial_watermark.tie_breaker, 0);
-        assert_eq!(runtime.max_rows, DEFAULT_MAX_ROWS);
-        assert_eq!(runtime.max_batch_bytes, DEFAULT_MAX_BATCH_BYTES);
-        assert_eq!(runtime.poll_interval, DEFAULT_POLL_INTERVAL);
-        assert_eq!(runtime.nack_backoff, DEFAULT_NACK_BACKOFF);
-    }
-
-    /// Scenario: a query omits a bind or reverses the configured composite order.
-    /// Guarantees: unsafe paging SQL is rejected before opening Oracle.
-    #[test]
-    fn query_requires_binds_and_matching_ascending_order() {
-        let mut missing_bind = valid_config();
-        missing_bind["query"] = json!(
-            "SELECT EVENT_TS, EVENT_ID FROM EVENTS WHERE EVENT_TS > :last_ts ORDER BY EVENT_TS ASC, EVENT_ID ASC"
-        );
-        assert!(serde_json::from_value::<Config>(missing_bind)
-            .and_then(|config| RuntimeConfig::try_from(config).map_err(serde::de::Error::custom))
-            .is_err());
-
-        let mut descending = valid_config();
-        descending["query"] = json!(
-            "SELECT EVENT_TS, EVENT_ID FROM EVENTS WHERE EVENT_TS > :last_ts AND EVENT_ID > :last_id ORDER BY EVENT_TS DESC, EVENT_ID ASC"
-        );
-        let config: Config = serde_json::from_value(descending).expect("shape");
-        assert!(RuntimeConfig::try_from(config).is_err());
-
-        let mut bind_prefix = valid_config();
-        bind_prefix["query"] = json!(
-            "SELECT EVENT_TS, EVENT_ID FROM EVENTS WHERE EVENT_TS > :last_ts_extra AND EVENT_ID > :last_id ORDER BY EVENT_TS ASC, EVENT_ID ASC"
-        );
-        let config: Config = serde_json::from_value(bind_prefix).expect("shape");
-        assert!(RuntimeConfig::try_from(config).is_err());
-
-        let mut nested_order = valid_config();
-        nested_order["query"] = json!(
-            "SELECT EVENT_TS, EVENT_ID FROM (SELECT EVENT_TS, EVENT_ID FROM EVENTS WHERE EVENT_TS > :last_ts OR (EVENT_TS = :last_ts AND EVENT_ID > :last_id) ORDER BY EVENT_TS ASC, EVENT_ID ASC) ORDER BY EVENT_ID DESC"
-        );
-        let config: Config = serde_json::from_value(nested_order).expect("shape");
-        assert!(RuntimeConfig::try_from(config).is_err());
-
-        let mut nested_only_order = valid_config();
-        nested_only_order["query"] = json!(
-            "SELECT EVENT_TS, EVENT_ID FROM (SELECT EVENT_TS, EVENT_ID FROM EVENTS WHERE EVENT_TS > :last_ts OR (EVENT_TS = :last_ts AND EVENT_ID > :last_id) ORDER BY EVENT_TS ASC, EVENT_ID ASC)"
-        );
-        let config: Config = serde_json::from_value(nested_only_order).expect("shape");
-        assert!(RuntimeConfig::try_from(config).is_err());
-
-        let mut bind_literal = valid_config();
-        bind_literal["query"] = json!(
-            "SELECT EVENT_TS, EVENT_ID FROM EVENTS WHERE ':last_ts' = ':last_ts' AND EVENT_ID > :last_id ORDER BY EVENT_TS ASC, EVENT_ID ASC"
-        );
-        let config: Config = serde_json::from_value(bind_literal).expect("shape");
-        assert!(RuntimeConfig::try_from(config).is_err());
-    }
-
-    /// Scenario: a watermark timestamp cannot be represented by the Oracle driver.
-    /// Guarantees: invalid initial state fails closed during configuration validation.
-    #[test]
-    fn invalid_initial_timestamp_fails_closed() {
-        let mut value = valid_config();
-        value["watermark"]["timestamp"]["initial"] = json!("not-a-timestamp");
-        let config: Config = serde_json::from_value(value).expect("shape");
-        assert!(RuntimeConfig::try_from(config).is_err());
-    }
-
-    /// Scenario: limits, identifiers, and unknown fields violate the receiver contract.
-    /// Guarantees: strict validation rejects unbounded or ambiguous configuration.
-    #[test]
-    fn strict_validation_rejects_invalid_fields_and_limits() {
-        for (field, value) in [
-            ("max_rows", json!(0)),
-            ("max_rows", json!(MAX_ROWS_LIMIT + 1)),
-            ("max_batch_bytes", json!(0)),
-            ("nack_backoff", json!("0s")),
-        ] {
-            let mut config = valid_config();
-            config[field] = value;
-            let config: Config = serde_json::from_value(config).expect("shape");
-            assert!(RuntimeConfig::try_from(config).is_err(), "{field}");
+impl OracleConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
         }
+    }
+}
 
-        let mut unknown = valid_config();
-        unknown["unknown"] = json!(true);
-        assert!(serde_json::from_value::<Config>(unknown).is_err());
+impl From<crate::receivers::database::ConfigError> for OracleConfigError {
+    fn from(error: crate::receivers::database::ConfigError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<QueryError> for OracleConfigError {
+    fn from(error: QueryError) -> Self {
+        Self::new(error.to_string())
     }
 }

@@ -10,42 +10,57 @@ groups:
     pipelines:
       main:
         nodes:
-          oracle:
+          oracle-audit:
             type: urn:otel:receiver:oracle
             config:
-              source_id: local-events
-              connect_string: //localhost:1521/FREEPDB1
-              username: PDBADMIN
-              password_env: ORACLE_PWD
-              query: >-
-                SELECT EVENT_TS, EVENT_ID, PAYLOAD
-                FROM OTAP_ORACLE_EVENTS
-                WHERE (
-                  EVENT_TS > :last_ts
-                  OR (EVENT_TS = :last_ts AND EVENT_ID > :last_id)
-                )
-                ORDER BY EVENT_TS ASC, EVENT_ID ASC
+              source_id: oracle-audit
+              connection:
+                connect_string: '${env:ORACLE_CONNECT_STRING:-//localhost:1521/FREEPDB1}'
+                instant_client_dir: '${env:ORACLE_INSTANT_CLIENT_DIR:-/opt/oracle/instantclient}'
+              authentication:
+                username_file: '${env:ORACLE_USERNAME_FILE:-/run/oracle-secrets/username}'
+                password_file: '${env:ORACLE_PASSWORD_FILE:-/run/oracle-secrets/password}'
+              query:
+                statement: >
+                  SELECT EVENT_ID, EVENT_TS, PAYLOAD
+                  FROM OTAP_ORACLE_EVENTS
+                  WHERE (
+                    EVENT_TS > :last_timestamp
+                    OR (
+                      EVENT_TS = :last_timestamp
+                      AND EVENT_ID > :last_tie_breaker
+                    )
+                  )
+                  ORDER BY EVENT_TS ASC, EVENT_ID ASC
+                interval: 5m
+                fetch_size: 1000
+                max_rows_per_poll: 10000
+                # Exact serialized OTLP ceiling for one emitted page.
+                max_batch_bytes: 10 MiB
+                # Normalized in-memory ceiling for one poll before encoding.
+                max_normalized_bytes: 10 MiB
+                timeout: 2m
               watermark:
+                mode: composite
                 timestamp:
                   column: EVENT_TS
-                  bind: last_ts
+                  bind: last_timestamp
                   initial: "1970-01-01 00:00:00"
+                  timezone: UTC
                 tie_breaker:
                   column: EVENT_ID
-                  bind: last_id
+                  bind: last_tie_breaker
                   initial: 0
               checkpoint:
-                directory: "${engine.state_dir}/oracle"
+                directory: ${engine.state_dir}/oracle
+                on_nack: rewind
+                nack_backoff: 1s
                 max_consecutive_failures: 5
-              nack_backoff: 1s
-              poll_interval: 10s
-              call_timeout: 10s
-              max_rows: 100
-              max_batch_bytes: 1 MiB
           console:
             type: exporter:console
-            config: {}
+            config:
+              format: pretty
 
         connections:
-          - from: oracle
+          - from: oracle-audit
             to: console
