@@ -15,6 +15,7 @@ integration/
 |   |-- integration_report_logs.yaml
 |-- continuous/             # Continuous integration test configurations (e.g. 100k LRPS)
 |-- nightly/                # Nightly, longer-running test configs (e.g. syslog scenarios)
+|-- oracle/                 # Oracle receiver single-poller benchmark
 |-- templates/              # Jinja2 templates for configs and test step workflows
     |-- configs/            # Templates in this directory are rendered into integration/configs/. and run by components
     |-- test_steps/
@@ -67,6 +68,11 @@ python ./orchestrator/run_orchestrator.py --debug --config ./test_suites/integra
 # OR
 python ./orchestrator/run_orchestrator.py --debug --config ./test_suites/integration/nightly/syslog-docker.yaml
 ```
+
+The Oracle receiver benchmark includes its Azure deployment template, host
+preparation, current environment status, baseline result, troubleshooting
+history, and cleanup instructions. See
+[`oracle/README.md`](oracle/README.md).
 
 ```shell
 $ python ./orchestrator/run_orchestrator.py --help

@@ -1,0 +1,105 @@
+steps:
+  - name: Reset benchmark state
+    action:
+      no_op: {}
+    hooks:
+      run:
+        pre:
+          - run_command:
+              command: >-
+                test -s ./test_suites/integration/configs/oracle/secrets/username &&
+                test -s ./test_suites/integration/configs/oracle/secrets/password &&
+                mkdir -p ./test_suites/integration/configs/oracle/checkpoints &&
+                find ./test_suites/integration/configs/oracle/checkpoints
+                -mindepth 1 -maxdepth 1 -type f -delete
+  - name: Deploy single-poller engine
+    action:
+      component_action:
+        phase: deploy
+        target: df-engine
+    hooks:
+      run:
+        pre:
+          - render_template:
+              template_path: >-
+                {{engine_config_template | default("./test_suites/integration/templates/configs/engine/oracle/single-poller.yaml.j2")}}
+              output_path: >-
+                ./test_suites/integration/configs/oracle/config.rendered.yaml
+              variables:
+                poll_interval: {{poll_interval | default("1ms")}}
+                fetch_size: {{fetch_size | default(10000)}}
+                max_rows_per_poll: {{max_rows_per_poll | default(10000)}}
+                max_batch_bytes: {{max_batch_bytes | default("64 MiB")}}
+                max_normalized_bytes: {{max_normalized_bytes | default("64 MiB")}}
+                query_timeout: {{query_timeout | default("2m")}}
+        post:
+          - ready_check_http:
+              url: http://localhost:8086/api/v1/telemetry/metrics?reset=false
+              method: GET
+              expected_status_code: 200
+  - name: Start monitoring
+    action:
+      component_action:
+        phase: start_monitoring
+        target: df-engine
+  - name: Warm up
+    action:
+      wait:
+        delay_seconds: {{warmup_interval | default(10)}}
+  - name: Observe single-poller load
+    action:
+      wait:
+        delay_seconds: {{observation_interval | default(60)}}
+    hooks:
+      run:
+        pre:
+          - record_event:
+              name: observation_start
+        post:
+          - record_event:
+              name: observation_stop
+  - name: Stop engine
+    hooks:
+      run:
+        pre:
+          - send_http_request:
+              url: >-
+                http://localhost:8086/api/v1/groups/shutdown?wait=true&timeout_secs={{drain_timeout_secs | default(60)}}
+              method: POST
+              headers:
+                "Content-Type": application/json
+              timeout: {{drain_timeout_secs | default(60) | int + 5}}
+              raise_for_status: false
+    action:
+      no_op: {}
+  - name: Stop monitoring
+    action:
+      component_action:
+        phase: stop_monitoring
+        target: df-engine
+  - name: Destroy engine
+    action:
+      component_action:
+        phase: destroy
+        target: df-engine
+  - name: Report single-poller results
+    action:
+      no_op: {}
+    hooks:
+      run:
+        post:
+          - print_container_logs: {}
+          - sql_report:
+              name: Oracle Receiver Single-Poller Report
+              report_config_file: >-
+                ./test_suites/integration/configs/oracle_receiver_report.yaml
+              output:
+                - format:
+                    template: {}
+                  destination:
+                    console: {}
+                - format:
+                    json: {}
+                  destination:
+                    file:
+                      directory: results/{{result_dir | default("oracle_single_poller")}}

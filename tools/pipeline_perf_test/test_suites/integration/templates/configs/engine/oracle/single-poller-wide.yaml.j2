@@ -1,0 +1,91 @@
+version: otel_dataflow/v1
+policies:
+  telemetry:
+    runtime_metrics: normal
+  channel_capacity:
+    control:
+      pipeline: 100
+      node: 100
+    pdata: 100
+engine: {}
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          oracle:
+            type: urn:otel:receiver:oracle
+            config:
+              source_id: oracle-single-poller-wide
+              connection:
+                connect_string: '${env:ORACLE_CONNECT_STRING}'
+                instant_client_dir: '${env:ORACLE_INSTANT_CLIENT_DIR:-/opt/oracle/instantclient_23_26}'
+              authentication:
+                username_file: /run/oracle-secrets/username
+                password_file: /run/oracle-secrets/password
+              query:
+                statement: >
+                  SELECT
+                    EVENT_ID,
+                    EVENT_TS,
+                    PAYLOAD_01,
+                    PAYLOAD_02,
+                    PAYLOAD_03,
+                    PAYLOAD_04,
+                    PAYLOAD_05,
+                    PAYLOAD_06,
+                    PAYLOAD_07,
+                    PAYLOAD_08,
+                    PAYLOAD_09,
+                    PAYLOAD_10,
+                    PAYLOAD_11,
+                    PAYLOAD_12,
+                    PAYLOAD_13,
+                    PAYLOAD_14,
+                    PAYLOAD_15,
+                    PAYLOAD_16
+                  FROM OTAP_BENCH.OTAP_ORACLE_WIDE_EVENTS
+                  WHERE (
+                    EVENT_TS > :last_timestamp
+                    OR (
+                      EVENT_TS = :last_timestamp
+                      AND EVENT_ID > :last_tie_breaker
+                    )
+                  )
+                  ORDER BY EVENT_TS ASC, EVENT_ID ASC
+                interval: {{poll_interval}}
+                fetch_size: {{fetch_size}}
+                max_rows_per_poll: {{max_rows_per_poll}}
+                max_batch_bytes: {{max_batch_bytes}}
+                max_normalized_bytes: {{max_normalized_bytes}}
+                timeout: {{query_timeout}}
+              watermark:
+                mode: composite
+                timestamp:
+                  column: EVENT_TS
+                  bind: last_timestamp
+                  initial: "1970-01-01 00:00:00"
+                  timezone: UTC
+                tie_breaker:
+                  column: EVENT_ID
+                  bind: last_tie_breaker
+                  initial: 0
+              checkpoint:
+                directory: /var/lib/otel-arrow/oracle
+                on_nack: rewind
+                nack_backoff: 1ms
+                max_consecutive_failures: 5
+          perf:
+            type: urn:otel:exporter:perf
+            policies:
+              telemetry:
+                item_counts: true
+            config:
+              frequency: 500
+              cpu_usage: false
+              mem_usage: false
+              disk_usage: false
+              io_usage: false
+        connections:
+          - from: oracle
+            to: perf

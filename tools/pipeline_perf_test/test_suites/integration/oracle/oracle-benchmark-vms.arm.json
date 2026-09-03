@@ -1,0 +1,416 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.1.0.0",
+  "metadata": {
+    "description": "Two Azure Linux VMs for the Oracle single-poller benchmark, with Docker storage on Premium SSD v2 data disks."
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "westus3"
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "oracle-bench",
+      "minLength": 1,
+      "maxLength": 40
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser"
+    },
+    "sshPublicKey": {
+      "type": "secureString"
+    },
+    "allowedSshSource": {
+      "type": "string",
+      "metadata": {
+        "description": "Public IPv4 CIDR allowed to SSH, for example 203.0.113.10/32. Use the narrowest stable CIDR available."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_E8bds_v5"
+    },
+    "availabilityZone": {
+      "type": "string",
+      "defaultValue": "1",
+      "allowedValues": [
+        "1",
+        "2",
+        "3"
+      ]
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.50.0.0/16"
+    },
+    "subnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.50.1.0/24"
+    },
+    "vm1PrivateIp": {
+      "type": "string",
+      "defaultValue": "10.50.1.4"
+    },
+    "vm2PrivateIp": {
+      "type": "string",
+      "defaultValue": "10.50.1.5"
+    },
+    "dataDiskSizeGiB": {
+      "type": "int",
+      "defaultValue": 512
+    },
+    "dataDiskIops": {
+      "type": "int",
+      "defaultValue": 3000
+    },
+    "dataDiskThroughputMBps": {
+      "type": "int",
+      "defaultValue": 500
+    },
+    "azureLinuxPublisher": {
+      "type": "string",
+      "defaultValue": "microsoftazurelinux"
+    },
+    "azureLinuxOffer": {
+      "type": "string",
+      "defaultValue": "azurelinux-4"
+    },
+    "azureLinuxSku": {
+      "type": "string",
+      "defaultValue": "4"
+    },
+    "azureLinuxVersion": {
+      "type": "string",
+      "defaultValue": "latest"
+    }
+  },
+  "variables": {
+    "vnetName": "[format('{0}-vnet', parameters('namePrefix'))]",
+    "subnetName": "compute",
+    "nsgName": "[format('{0}-nsg', parameters('namePrefix'))]",
+    "natGatewayName": "[format('{0}-nat', parameters('namePrefix'))]",
+    "natPublicIpName": "[format('{0}-nat-pip', parameters('namePrefix'))]",
+    "privateIps": [
+      "[parameters('vm1PrivateIp')]",
+      "[parameters('vm2PrivateIp')]"
+    ],
+    "cloudInit": "#cloud-config\npackage_update: true\npackages:\n  - moby-engine\n  - docker-cli\n  - docker-compose\n  - docker-buildx\n  - policycoreutils-python-utils\nwrite_files:\n  - path: /usr/local/sbin/configure-benchmark-host.sh\n    permissions: '0755'\n    content: |\n      #!/bin/sh\n      set -eu\n      for i in $(seq 1 60); do\n        test -b /dev/disk/azure/scsi1/lun0 && break\n        sleep 2\n      done\n      DISK=/dev/disk/azure/scsi1/lun0\n      test -b \"$DISK\"\n      if ! blkid \"$DISK\" >/dev/null 2>&1; then\n        mkfs.xfs -f \"$DISK\"\n      fi\n      mkdir -p /data\n      UUID=$(blkid -s UUID -o value \"$DISK\")\n      grep -q \"$UUID\" /etc/fstab || echo \"UUID=$UUID /data xfs defaults,nofail 0 2\" >>/etc/fstab\n      systemctl stop docker.service docker.socket containerd.service || true\n      mount -a\n      mkdir -p /data/docker /data/containerd /etc/docker /etc/containerd\n      printf '%s\\n' '{\"data-root\":\"/data/docker\"}' >/etc/docker/daemon.json\n      if [ ! -s /etc/containerd/config.toml ]; then\n        containerd config default >/etc/containerd/config.toml\n      fi\n      if grep -q '^root = ' /etc/containerd/config.toml; then\n        sed -i 's#^root = .*#root = \"/data/containerd\"#' /etc/containerd/config.toml\n      else\n        sed -i '1i root = \"/data/containerd\"' /etc/containerd/config.toml\n      fi\n      semanage fcontext -a -e /var/lib/docker /data/docker 2>/dev/null || semanage fcontext -m -e /var/lib/docker /data/docker\n      semanage fcontext -a -e /var/lib/containerd /data/containerd 2>/dev/null || semanage fcontext -m -e /var/lib/containerd /data/containerd\n      restorecon -RF /data/docker /data/containerd\n      chown ${ADMIN_USER}:${ADMIN_USER} /data\n      systemctl reset-failed containerd.service docker.service\n      systemctl enable --now containerd.service docker.service\n      usermod -aG docker ${ADMIN_USER}\nruncmd:\n  - [ sh, -c, '/usr/local/sbin/configure-benchmark-host.sh' ]\n"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('natPublicIpName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "zones": [
+        "[parameters('availabilityZone')]"
+      ],
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4"
+      }
+    },
+    {
+      "type": "Microsoft.Network/natGateways",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('natGatewayName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "zones": [
+        "[parameters('availabilityZone')]"
+      ],
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('natPublicIpName'))]"
+      ],
+      "properties": {
+        "idleTimeoutInMinutes": 10,
+        "publicIpAddresses": [
+          {
+            "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('natPublicIpName'))]"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "AllowSshFromApprovedSource",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "22",
+              "sourceAddressPrefix": "[parameters('allowedSshSource')]",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "AllowIntraVnetInbound",
+            "properties": {
+              "priority": 110,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork"
+            }
+          },
+          {
+            "name": "AllowIntraVnetOutbound",
+            "properties": {
+              "priority": 100,
+              "direction": "Outbound",
+              "access": "Allow",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork"
+            }
+          },
+          {
+            "name": "AllowInternetOutbound",
+            "properties": {
+              "priority": 110,
+              "direction": "Outbound",
+              "access": "Allow",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "Internet"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]",
+        "[resourceId('Microsoft.Network/natGateways', variables('natGatewayName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('vnetAddressPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('subnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('subnetAddressPrefix')]",
+              "privateEndpointNetworkPolicies": "Disabled",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              },
+              "natGateway": {
+                "id": "[resourceId('Microsoft.Network/natGateways', variables('natGatewayName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "vmPublicIpLoop",
+        "count": 2
+      },
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}-vm-{1}-pip', parameters('namePrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "zones": [
+        "[parameters('availabilityZone')]"
+      ],
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4"
+      }
+    },
+    {
+      "copy": {
+        "name": "vmDataDiskLoop",
+        "count": 2
+      },
+      "type": "Microsoft.Compute/disks",
+      "apiVersion": "2024-03-02",
+      "name": "[format('{0}-vm-{1}-data', parameters('namePrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "zones": [
+        "[parameters('availabilityZone')]"
+      ],
+      "sku": {
+        "name": "PremiumV2_LRS"
+      },
+      "properties": {
+        "creationData": {
+          "createOption": "Empty"
+        },
+        "diskSizeGB": "[parameters('dataDiskSizeGiB')]",
+        "diskIOPSReadWrite": "[parameters('dataDiskIops')]",
+        "diskMBpsReadWrite": "[parameters('dataDiskThroughputMBps')]",
+        "networkAccessPolicy": "DenyAll",
+        "publicNetworkAccess": "Disabled"
+      }
+    },
+    {
+      "copy": {
+        "name": "vmNicLoop",
+        "count": 2
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}-vm-{1}-nic', parameters('namePrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "vmPublicIpLoop"
+      ],
+      "properties": {
+        "enableAcceleratedNetworking": true,
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('privateIps')[copyIndex()]]",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('subnetName'))]"
+              },
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm-{1}-pip', parameters('namePrefix'), add(copyIndex(), 1)))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "vmLoop",
+        "count": 2
+      },
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2024-03-01",
+      "name": "[format('{0}-vm-{1}', parameters('namePrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "zones": [
+        "[parameters('availabilityZone')]"
+      ],
+      "dependsOn": [
+        "vmNicLoop",
+        "vmDataDiskLoop"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[format('oracle-vm-{0}', add(copyIndex(), 1))]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "customData": "[base64(replace(variables('cloudInit'), '${ADMIN_USER}', parameters('adminUsername')))]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "provisionVMAgent": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                  "keyData": "[parameters('sshPublicKey')]"
+                }
+              ]
+            }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "[parameters('azureLinuxPublisher')]",
+            "offer": "[parameters('azureLinuxOffer')]",
+            "sku": "[parameters('azureLinuxSku')]",
+            "version": "[parameters('azureLinuxVersion')]"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "caching": "ReadWrite",
+            "managedDisk": {
+              "storageAccountType": "Premium_LRS"
+            }
+          },
+          "dataDisks": [
+            {
+              "lun": 0,
+              "createOption": "Attach",
+              "managedDisk": {
+                "id": "[resourceId('Microsoft.Compute/disks', format('{0}-vm-{1}-data', parameters('namePrefix'), add(copyIndex(), 1)))]"
+              },
+              "caching": "None",
+              "writeAcceleratorEnabled": false
+            }
+          ]
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm-{1}-nic', parameters('namePrefix'), add(copyIndex(), 1)))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "vm1PublicIp": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm-1-pip', parameters('namePrefix'))), '2024-05-01').ipAddress]"
+    },
+    "vm2PublicIp": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm-2-pip', parameters('namePrefix'))), '2024-05-01').ipAddress]"
+    },
+    "vm1PrivateIp": {
+      "type": "string",
+      "value": "[parameters('vm1PrivateIp')]"
+    },
+    "vm2PrivateIp": {
+      "type": "string",
+      "value": "[parameters('vm2PrivateIp')]"
+    },
+    "sshExamples": {
+      "type": "array",
+      "value": [
+        "[format('ssh {0}@{1}', parameters('adminUsername'), reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm-1-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)]",
+        "[format('ssh {0}@{1}', parameters('adminUsername'), reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm-2-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)]"
+      ]
+    }
+  }
+}
