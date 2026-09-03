@@ -364,6 +364,65 @@ native row fetching, network waits, or checkpoint latency are more likely
 constraints. Collect Oracle VM CPU, disk, and network metrics before attributing
 the limit to one specific layer.
 
+## 64 KiB byte-throughput profile
+
+The narrow profile and its `prepare-oracle.sh` setup are prerequisites. The
+separate `single-poller-wide.yaml` profile tests whether the unchanged receiver
+can approach 200 MB/s using 16 `VARCHAR2(4000)` payload columns, or 64,000 source
+payload bytes per row.
+
+On VM 1, download or copy `prepare-oracle-wide.sh`, then create the wide table:
+
+```shell
+export ORACLE_SYS_PASSWORD="$(cat ~/oracle-system-password)"
+export ORACLE_WIDE_BENCHMARK_ROWS=2500000
+export ORACLE_WIDE_BATCH_ROWS=10000
+export ORACLE_COLLISION_SIZE=100
+
+chmod +x ./prepare-oracle-wide.sh
+./prepare-oracle-wide.sh
+```
+
+The default load is approximately 160 GB before Oracle row and index overhead.
+It is committed in 10,000-row batches and can take substantial time. Confirm
+adequate space before starting:
+
+```shell
+df -h /data
+docker exec oracle-ee df -h /opt/oracle/oradata
+```
+
+The default 2.5 million rows provide comfortable headroom for a 200 MB/s
+five-minute observation. Use at least four million rows when testing a receiver
+already expected to exceed 400 MB/s, subject to available disk space.
+
+On VM 2, no receiver image rebuild is needed. Run:
+
+```shell
+cd ~/otel-arrow/tools/pipeline_perf_test
+. .venv/bin/activate
+
+python ./orchestrator/run_orchestrator.py \
+  --debug \
+  --docker.no-build \
+  --config ./test_suites/integration/oracle/single-poller-wide.yaml
+```
+
+The profile uses 3,000-row pages, 256 MiB byte limits, a 30-second warmup, and a
+five-minute observation. Results are written to
+`results/oracle_single_poller_wide`.
+
+Use `encoded_bytes_per_second` to evaluate the target:
+
+```text
+200 MB/s = 200,000,000 encoded bytes per second
+400 MB/s = 400,000,000 encoded bytes per second
+```
+
+The run is valid only when `backlog_sustained` is `true`, `empty_polls` is zero,
+and every failure, NACK, and replay counter is zero. This measures encoded OTLP
+bytes produced by the receiver, not bytes transmitted to a remote backend.
+
 ## Troubleshooting lessons
 
 | Symptom | Cause and correction |

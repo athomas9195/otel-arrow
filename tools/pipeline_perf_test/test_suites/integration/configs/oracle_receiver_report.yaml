@@ -93,6 +93,21 @@ queries:
         COALESCE(encoded_bytes_sent, 0) AS encoded_bytes_sent,
         COALESCE(encoded_bytes_sent, 0) / NULLIF(duration_seconds, 0)
           AS encoded_bytes_per_second,
+        COALESCE(encoded_bytes_sent, 0) /
+          NULLIF(duration_seconds * 1000000, 0)
+          AS encoded_megabytes_per_second,
+        COALESCE(
+          COALESCE(encoded_bytes_sent, 0) /
+            NULLIF(duration_seconds, 0) >= 200000000,
+          FALSE
+        )
+          AS reached_200_mb_per_second,
+        COALESCE(
+          COALESCE(encoded_bytes_sent, 0) /
+            NULLIF(duration_seconds, 0) >= 400000000,
+          FALSE
+        )
+          AS reached_400_mb_per_second,
         COALESCE(polls, 0) AS polls,
         GREATEST(COALESCE(polls, 0) - COALESCE(batches_sent, 0), 0)
           AS empty_polls,

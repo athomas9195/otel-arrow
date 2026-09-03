@@ -22,7 +22,7 @@ steps:
         pre:
           - render_template:
               template_path: >-
-                ./test_suites/integration/templates/configs/engine/oracle/single-poller.yaml.j2
+                {{engine_config_template | default("./test_suites/integration/templates/configs/engine/oracle/single-poller.yaml.j2")}}
               output_path: >-
                 ./test_suites/integration/configs/oracle/config.rendered.yaml
               variables:
