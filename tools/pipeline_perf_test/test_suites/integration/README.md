@@ -69,9 +69,10 @@ python ./orchestrator/run_orchestrator.py --debug --config ./test_suites/integra
 python ./orchestrator/run_orchestrator.py --debug --config ./test_suites/integration/nightly/syslog-docker.yaml
 ```
 
-The Oracle receiver benchmark requires two prepared hosts and an Oracle-enabled
-engine image. See
-[`oracle/README.md`](oracle/README.md) for provisioning and run instructions.
+The Oracle receiver benchmark includes its Azure deployment template, host
+preparation, current environment status, baseline result, troubleshooting
+history, and cleanup instructions. See
+[`oracle/README.md`](oracle/README.md).
 
 ```shell
 $ python ./orchestrator/run_orchestrator.py --help
