@@ -1,0 +1,136 @@
+queries:
+  - name: Calculate observation window
+    sql: |
+      CREATE TABLE observation_window AS
+      WITH event_times AS (
+        SELECT
+          "attributes.test.name" AS test_name,
+          name AS event_name,
+          TO_TIMESTAMP(timestamp / 1000000000.0) AS timestamp
+        FROM events
+        WHERE name IN ('observation_start', 'observation_stop')
+      )
+      SELECT
+        start.test_name,
+        start.timestamp AS start_ts,
+        stop.timestamp AS stop_ts,
+        EXTRACT(EPOCH FROM (stop.timestamp - start.timestamp)) AS duration_seconds
+      FROM event_times start
+      JOIN event_times stop ON start.test_name = stop.test_name
+      JOIN metadata_row ON metadata_row."test.name" = start.test_name
+      WHERE start.event_name = 'observation_start'
+        AND stop.event_name = 'observation_stop'
+        AND start.timestamp < stop.timestamp;
+
+  - name: Calculate database receiver counter deltas
+    sql: |
+      CREATE TABLE receiver_counter_deltas AS
+      WITH receiver_samples AS (
+        SELECT
+          CASE
+            WHEN metric_name = 'encoded_bytes_sent_bytes'
+              THEN 'encoded_bytes_sent'
+            ELSE metric_name
+          END AS metric_name,
+          timestamp,
+          value
+        FROM metrics
+        CROSS JOIN observation_window
+        WHERE "metric_attributes.component_name" = 'df-engine'
+          AND "metric_attributes.otel_scope_name" = 'receiver.database'
+          AND timestamp BETWEEN start_ts AND stop_ts
+          AND metric_name IN (
+            'polls',
+            'query_failures',
+            'batches_sent',
+            'rows_sent',
+            'encoded_bytes_sent_bytes',
+            'acks',
+            'nacks',
+            'replays',
+            'stale_feedback',
+            'checkpoint_commits',
+            'checkpoint_failures',
+            'checkpoint_cleanup_failures',
+            'cancellations'
+          )
+      ),
+      expected_metrics(metric_name) AS (
+        VALUES
+          ('polls'),
+          ('query_failures'),
+          ('batches_sent'),
+          ('rows_sent'),
+          ('encoded_bytes_sent'),
+          ('acks'),
+          ('nacks'),
+          ('replays'),
+          ('stale_feedback'),
+          ('checkpoint_commits'),
+          ('checkpoint_failures'),
+          ('checkpoint_cleanup_failures'),
+          ('cancellations')
+      )
+      SELECT
+        expected_metrics.metric_name,
+        COALESCE(MAX(value) - MIN(value), 0) AS total_increase
+      FROM expected_metrics
+      LEFT JOIN receiver_samples USING (metric_name)
+      GROUP BY expected_metrics.metric_name
+      ORDER BY expected_metrics.metric_name;
+
+  - name: Calculate single-poller summary
+    sql: |
+      CREATE TABLE single_poller_summary AS
+      WITH counters AS (
+        PIVOT receiver_counter_deltas
+        ON metric_name
+        USING MAX(total_increase)
+      )
+      SELECT
+        COALESCE(rows_sent, 0) AS rows_sent,
+        COALESCE(rows_sent, 0) / NULLIF(duration_seconds, 0) AS rows_per_second,
+        COALESCE(encoded_bytes_sent, 0) AS encoded_bytes_sent,
+        COALESCE(encoded_bytes_sent, 0) / NULLIF(duration_seconds, 0)
+          AS encoded_bytes_per_second,
+        COALESCE(polls, 0) AS polls,
+        GREATEST(COALESCE(polls, 0) - COALESCE(batches_sent, 0), 0)
+          AS empty_polls,
+        COALESCE(polls, 0) = COALESCE(batches_sent, 0)
+          AS backlog_sustained,
+        COALESCE(rows_sent, 0) / NULLIF(polls, 0) AS rows_per_poll,
+        COALESCE(batches_sent, 0) AS batches_sent,
+        COALESCE(rows_sent, 0) / NULLIF(batches_sent, 0) AS rows_per_batch,
+        COALESCE(acks, 0) AS acknowledgements,
+        COALESCE(checkpoint_commits, 0) AS checkpoint_commits,
+        COALESCE(query_failures, 0) AS query_failures,
+        COALESCE(nacks, 0) AS negative_acknowledgements,
+        COALESCE(replays, 0) AS replays,
+        COALESCE(checkpoint_failures, 0) AS checkpoint_failures,
+        duration_seconds
+      FROM counters
+      CROSS JOIN observation_window;
+
+  - name: Calculate receiver resource usage
+    sql: |
+      CREATE TABLE receiver_resource_usage AS
+      SELECT
+        metric_name,
+        MIN(value) AS min_value,
+        AVG(value) AS avg_value,
+        MAX(value) AS max_value
+      FROM metrics
+      CROSS JOIN observation_window
+      WHERE "metric_attributes.component_name" = 'df-engine'
+        AND metric_name IN ('container.cpu.usage', 'container.memory.usage')
+        AND timestamp BETWEEN start_ts AND stop_ts
+      GROUP BY metric_name
+      ORDER BY metric_name;
+
+result_tables:
+  - name: single_poller_summary
+    description: Throughput and delivery health for one Oracle receiver poller.
+  - name: receiver_resource_usage
+    description: Receiver container CPU cores and memory bytes during observation.
+  - name: receiver_counter_deltas
+    description: Raw receiver.database counter increases during observation.
