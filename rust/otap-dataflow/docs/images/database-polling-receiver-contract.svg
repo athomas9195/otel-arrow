@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #17365d; }
+      .subtitle { font: 600 22px Arial, sans-serif; fill: #2f5597; }
+      .label { font: 700 19px Arial, sans-serif; fill: #17365d; }
+      .text { font: 16px Arial, sans-serif; fill: #1f2937; }
+      .small { font: 14px Arial, sans-serif; fill: #374151; }
+      .box { stroke: #2f5597; stroke-width: 3; rx: 14; ry: 14; }
+      .arrow { stroke: #4b5563; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #7f8c8d; stroke-width: 2; stroke-dasharray: 9 7; fill: none; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#4b5563"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="1120" fill="#ffffff"/>
+  <text x="800" y="52" text-anchor="middle" class="title">Database Polling Receiver Contract</text>
+  <text x="800" y="88" text-anchor="middle" class="subtitle">One semantic receiver, two deployment profiles</text>
+
+  <rect x="55" y="125" width="720" height="735" fill="#f5f9ff" class="box"/>
+  <text x="415" y="165" text-anchor="middle" class="subtitle">Profile A: Initial near-source shim</text>
+
+  <rect x="95" y="205" width="250" height="105" fill="#fff2cc" class="box"/>
+  <text x="220" y="240" text-anchor="middle" class="label">Local bootstrap inputs</text>
+  <text x="220" y="270" text-anchor="middle" class="text">Environment or local file</text>
+  <text x="220" y="294" text-anchor="middle" class="small">Secret references, not values</text>
+
+  <rect x="455" y="205" width="270" height="105" fill="#e2f0d9" class="box"/>
+  <text x="590" y="240" text-anchor="middle" class="label">Thin Dataflow shim</text>
+  <text x="590" y="270" text-anchor="middle" class="text">Build constrained config</text>
+  <text x="590" y="294" text-anchor="middle" class="small">No duplicate receiver logic</text>
+  <path d="M345 257 H455" class="arrow"/>
+
+  <rect x="210" y="375" width="355" height="155" fill="#d9eaf7" class="box"/>
+  <text x="387" y="412" text-anchor="middle" class="label">Vendor database receiver</text>
+  <text x="387" y="442" text-anchor="middle" class="text">One query and one source cursor</text>
+  <text x="387" y="468" text-anchor="middle" class="text">Bounded read-only polling</text>
+  <text x="387" y="494" text-anchor="middle" class="text">Rows to typed OTLP attributes</text>
+  <text x="387" y="518" text-anchor="middle" class="small">Singleton owner and local checkpoint</text>
+  <path d="M590 310 V345 H387 V375" class="arrow"/>
+
+  <rect x="210" y="595" width="355" height="95" fill="#e2f0d9" class="box"/>
+  <text x="387" y="632" text-anchor="middle" class="label">Existing OTLP exporter</text>
+  <text x="387" y="661" text-anchor="middle" class="text">TLS and authentication</text>
+  <path d="M387 530 V595" class="arrow"/>
+
+  <rect x="210" y="755" width="355" height="70" fill="#fce4d6" class="box"/>
+  <text x="387" y="786" text-anchor="middle" class="label">Open checkpoint-success boundary</text>
+  <text x="387" y="811" text-anchor="middle" class="small">Local export, remote accept, buffer, or final destination?</text>
+  <path d="M387 690 V755" class="arrow"/>
+
+  <rect x="825" y="125" width="720" height="735" fill="#f7fbf7" class="box"/>
+  <text x="1185" y="165" text-anchor="middle" class="subtitle">Profile B: Managed receiver node</text>
+
+  <rect x="875" y="205" width="270" height="105" fill="#fff2cc" class="box"/>
+  <text x="1010" y="240" text-anchor="middle" class="label">Managed configuration</text>
+  <text x="1010" y="270" text-anchor="middle" class="text">Product-specific resource</text>
+  <text x="1010" y="294" text-anchor="middle" class="small">Secret and state references</text>
+
+  <rect x="1225" y="205" width="270" height="105" fill="#e2f0d9" class="box"/>
+  <text x="1360" y="240" text-anchor="middle" class="label">Managed translator</text>
+  <text x="1360" y="270" text-anchor="middle" class="text">Build native Dataflow config</text>
+  <text x="1360" y="294" text-anchor="middle" class="small">Same semantic receiver config</text>
+  <path d="M1145 257 H1225" class="arrow"/>
+
+  <rect x="1010" y="375" width="355" height="155" fill="#d9eaf7" class="box"/>
+  <text x="1187" y="412" text-anchor="middle" class="label">Same vendor receiver</text>
+  <text x="1187" y="442" text-anchor="middle" class="text">Same query and cursor rules</text>
+  <text x="1187" y="468" text-anchor="middle" class="text">Same bounds and type mapping</text>
+  <text x="1187" y="494" text-anchor="middle" class="text">Same restart and replay semantics</text>
+  <text x="1187" y="518" text-anchor="middle" class="small">Hosting does not redefine source behavior</text>
+  <path d="M1360 310 V345 H1187 V375" class="arrow"/>
+
+  <rect x="1010" y="595" width="355" height="95" fill="#e2f0d9" class="box"/>
+  <text x="1187" y="632" text-anchor="middle" class="label">Processors, buffer, exporter</text>
+  <text x="1187" y="661" text-anchor="middle" class="text">Managed destination path</text>
+  <path d="M1187 530 V595" class="arrow"/>
+
+  <rect x="1010" y="755" width="355" height="70" fill="#fff2cc" class="box"/>
+  <text x="1187" y="786" text-anchor="middle" class="label">Named managed success boundary</text>
+  <text x="1187" y="811" text-anchor="middle" class="small">Checkpoint only after the configured boundary succeeds</text>
+  <path d="M1187 690 V755" class="arrow"/>
+
+  <rect x="210" y="915" width="1180" height="155" fill="#f2f2f2" class="box"/>
+  <text x="800" y="952" text-anchor="middle" class="subtitle">Shared behavioral contract</text>
+  <text x="800" y="986" text-anchor="middle" class="text">Vendor URN | one logical source | deterministic cursor | typed attributes | bounded polling</text>
+  <text x="800" y="1016" text-anchor="middle" class="text">candidate vs committed progress | at-least-once replay | validation | redaction | singleton ownership</text>
+  <text x="800" y="1048" text-anchor="middle" class="small">Crate placement, multi-query scheduling, distributed coordination, metrics, and network OTAP remain open</text>
+
+  <path d="M775 505 H825" class="dash"/>
+  <text x="800" y="488" text-anchor="middle" class="small">same semantics</text>
+</svg>
