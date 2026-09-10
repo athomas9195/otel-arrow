@@ -1,0 +1,21 @@
+# Design-only pseudocode at the intended production path.
+# This crate is excluded from the workspace until implementation.
+
+[package]
+name = "otel-arrow-dfe-receiver-sql-server"
+version = "0.0.0"
+description = "SQL Server database polling receiver for OTAP Dataflow"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+otel-arrow-dfe-config = { path = "../config" }
+otel-arrow-dfe-database-scraper = { path = "../database-scraper" }
+otel-arrow-dfe-engine = { path = "../engine" }
+otel-arrow-dfe-otap = { path = "../otap" }
+linkme = "0.3.35"
+serde_json = "1"
+
+# The selected TDS/SQL Server driver will belong only here.

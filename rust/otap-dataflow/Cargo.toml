@@ -8,6 +8,14 @@ exclude = [
     # Reference WASM guest plugin, built on demand for the wasm-host
     # integration test and compiled for the wasm32-wasip2 target only.
     "crates/wasm-host/plugins/severity-filter",
+    # Design-only database receiver skeletons. Remove these exclusions as each
+    # crate becomes a compiling implementation and joins the workspace.
+    "crates/database-agent",
+    "crates/database-scraper",
+    "crates/receiver-mysql",
+    "crates/receiver-oracle",
+    "crates/receiver-postgresql",
+    "crates/receiver-sql-server",
 ]
 resolver = "2"
 
@@ -45,6 +53,12 @@ otel-arrow-dfe-dev-nodes = { workspace = true, optional = true }
 otel-arrow-dfe-engine.workspace = true
 otel-arrow-dfe-otap.workspace = true
 otel-arrow-dfe-wasm-host = { workspace = true, optional = true }
+# Design-only database receiver dependencies. Uncomment each entry when its
+# excluded skeleton crate becomes a compiling workspace member.
+# otel-arrow-dfe-receiver-oracle = { workspace = true, optional = true }
+# otel-arrow-dfe-receiver-postgresql = { workspace = true, optional = true }
+# otel-arrow-dfe-receiver-sql-server = { workspace = true, optional = true }
+# otel-arrow-dfe-receiver-mysql = { workspace = true, optional = true }
 clap.workspace = true
 mimalloc = { workspace = true, optional = true }
 dhat = { workspace = true, optional = true }
@@ -69,6 +83,13 @@ otel-arrow-dfe-engine = { version = "0.55.0", path = "crates/engine" }
 otel-arrow-dfe-expohisto = { version = "0.55.0", path = "crates/expohisto" }
 otel-arrow-dfe-otap = { version = "0.55.0", path = "crates/otap" }
 otel-arrow-dfe-wasm-host = { path = "crates/wasm-host" }
+# Design-only workspace dependencies. Uncomment each entry when implementing
+# the corresponding crate and remove that crate from the workspace exclusions.
+# otel-arrow-dfe-database-scraper = { version = "0.55.0", path = "crates/database-scraper" }
+# otel-arrow-dfe-receiver-oracle = { version = "0.55.0", path = "crates/receiver-oracle" }
+# otel-arrow-dfe-receiver-postgresql = { version = "0.55.0", path = "crates/receiver-postgresql" }
+# otel-arrow-dfe-receiver-sql-server = { version = "0.55.0", path = "crates/receiver-sql-server" }
+# otel-arrow-dfe-receiver-mysql = { version = "0.55.0", path = "crates/receiver-mysql" }
 otel-arrow-dfe-test-tls-certs = { path = "crates/otap-test-tls-certs" }
 otel-arrow-dfe-test-net = { path = "crates/otap-test-net" }
 otel-arrow-dfe-pdata = { version = "0.55.0", path = "crates/pdata" }
@@ -301,6 +322,12 @@ otel-arrow-dfe-pdata-views = { path = "crates/pdata-views" }
 
 [features]
 default = ["jemalloc", "crypto-ring", "dev-tools", "admin-live-logs-ws"]
+# Design-only host features. Enable these definitions when the matching
+# optional receiver dependencies above become production workspace crates.
+# oracle-receiver = ["dep:otel-arrow-dfe-receiver-oracle"]
+# postgresql-receiver = ["dep:otel-arrow-dfe-receiver-postgresql"]
+# sql-server-receiver = ["dep:otel-arrow-dfe-receiver-sql-server"]
+# mysql-receiver = ["dep:otel-arrow-dfe-receiver-mysql"]
 jemalloc = [
     "dep:tikv-jemallocator",
     "otel-arrow-dfe-engine/jemalloc",

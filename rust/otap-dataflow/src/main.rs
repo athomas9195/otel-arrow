@@ -19,6 +19,16 @@ use otel_arrow_dfe_controller::{BuildInfo, Controller, ControllerRunOptions};
 // distributed-slice registrations (core nodes) are visible
 // in `OTAP_PIPELINE_FACTORY` at runtime.
 use otel_arrow_dfe_core_nodes as _;
+// Design-only database receiver registration imports. Uncomment each import
+// when its optional Cargo dependency and feature become production code.
+// #[cfg(feature = "mysql-receiver")]
+// use otel_arrow_dfe_receiver_mysql as _;
+// #[cfg(feature = "oracle-receiver")]
+// use otel_arrow_dfe_receiver_oracle as _;
+// #[cfg(feature = "postgresql-receiver")]
+// use otel_arrow_dfe_receiver_postgresql as _;
+// #[cfg(feature = "sql-server-receiver")]
+// use otel_arrow_dfe_receiver_sql_server as _;
 // Development nodes are omitted from builds that disable `dev-tools`.
 #[cfg(feature = "dev-tools")]
 use otel_arrow_dfe_dev_nodes as _;

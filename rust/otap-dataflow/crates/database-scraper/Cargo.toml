@@ -1,0 +1,19 @@
+# Design-only pseudocode at the intended production path.
+# This crate is excluded from the workspace until implementation.
+
+[package]
+name = "otel-arrow-dfe-database-scraper"
+version = "0.0.0"
+description = "Shared host-neutral runtime for database polling receivers"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+otel-arrow-dfe-engine = { path = "../engine" }
+otel-arrow-dfe-otap = { path = "../otap" }
+otel-arrow-dfe-pdata = { path = "../pdata" }
+otel-arrow-dfe-telemetry = { path = "../telemetry" }
+
+# No Oracle, PostgreSQL, SQL Server, or MySQL dependency belongs here.

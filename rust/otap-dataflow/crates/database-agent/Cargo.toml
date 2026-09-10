@@ -1,0 +1,34 @@
+# Design-only pseudocode at the intended production path.
+# This crate is excluded from the workspace until implementation.
+
+[package]
+name = "otel-arrow-dfe-database-agent"
+version = "0.0.0"
+description = "Constrained customer-side host for database polling receivers"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "otel-arrow-database-agent"
+path = "src/main.rs"
+
+[dependencies]
+otel-arrow-dfe-config = { path = "../config" }
+otel-arrow-dfe-controller = { path = "../controller" }
+# Reuses the existing OTLP exporter. Review its broader dependency inventory
+# before customer packaging; do not duplicate the exporter in this agent.
+otel-arrow-dfe-core-nodes = { path = "../core-nodes" }
+otel-arrow-dfe-otap = { path = "../otap" }
+
+otel-arrow-dfe-receiver-oracle = { path = "../receiver-oracle", optional = true }
+otel-arrow-dfe-receiver-postgresql = { path = "../receiver-postgresql", optional = true }
+otel-arrow-dfe-receiver-sql-server = { path = "../receiver-sql-server", optional = true }
+otel-arrow-dfe-receiver-mysql = { path = "../receiver-mysql", optional = true }
+
+[features]
+default = []
+oracle = ["dep:otel-arrow-dfe-receiver-oracle"]
+postgresql = ["dep:otel-arrow-dfe-receiver-postgresql"]
+sql-server = ["dep:otel-arrow-dfe-receiver-sql-server"]
+mysql = ["dep:otel-arrow-dfe-receiver-mysql"]
