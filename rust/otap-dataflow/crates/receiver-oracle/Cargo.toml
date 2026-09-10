@@ -1,0 +1,21 @@
+# Design-only pseudocode at the intended production path.
+# This crate is excluded from the workspace until implementation.
+
+[package]
+name = "otel-arrow-dfe-receiver-oracle"
+version = "0.0.0"
+description = "Oracle database polling receiver for OTAP Dataflow"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+otel-arrow-dfe-config = { path = "../config" }
+otel-arrow-dfe-database-scraper = { path = "../database-scraper" }
+otel-arrow-dfe-engine = { path = "../engine" }
+otel-arrow-dfe-otap = { path = "../otap" }
+linkme = "0.3.35"
+serde_json = "1"
+
+# The selected Oracle driver and native-library bindings will belong only here.

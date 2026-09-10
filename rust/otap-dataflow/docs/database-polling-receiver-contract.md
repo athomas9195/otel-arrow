@@ -9,6 +9,10 @@ Related issues:
 - [Shared runtime and vendor-specific database polling receivers](https://github.com/open-telemetry/otel-arrow/issues/3918)
 - [Common source coordination runtime](https://github.com/open-telemetry/otel-arrow/issues/4001)
 
+Companion design:
+
+- [Agent-Based Database Receiver Architecture Skeleton](database-receiver-agent-architecture/README.md)
+
 ## Purpose
 
 This document proposes the minimum behavioral contract for a database polling
@@ -27,6 +31,10 @@ both deployment profiles.
 This document defines a contract for review. It does not approve a permanent
 crate hierarchy or require the full multi-vendor runtime to be implemented in
 one pull request.
+
+The companion architecture skeleton makes one candidate crate graph concrete
+so its dependency direction, link-time registration, and agent composition can
+be reviewed without treating the proposed crate names or APIs as approved.
 
 ## Decision language
 

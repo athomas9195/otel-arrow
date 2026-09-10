@@ -29,3 +29,7 @@ See [Load Balancing: Challenges & Solutions](load-balancing.md).
 The proposed shared behavioral contract and initial near-source deployment
 profile are documented in
 [Database Polling Receiver Contract](database-polling-receiver-contract.md).
+
+The proposed crate boundaries, link-time component composition, and
+customer-side agent distribution are demonstrated in the
+[Agent-Based Database Receiver Architecture Skeleton](database-receiver-agent-architecture/README.md).
