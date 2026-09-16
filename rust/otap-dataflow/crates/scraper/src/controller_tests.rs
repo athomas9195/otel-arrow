@@ -566,3 +566,71 @@ fn matching_ack_commits_through_the_checkpoint_contract() {
     assert_eq!(committed.revision, 1);
     assert_eq!(committed.cursor.tie_breaker, 1);
 }
+
+/// Scenario: A complete receiver page reaches downstream and receives a matching ACK.
+/// Guarantees: The production receiver loop persists the last emitted cursor before processing
+/// shutdown, proving that subscription call data, ACK correlation, and durable commit are wired
+/// together rather than only tested as isolated state helpers.
+#[test]
+fn matching_ack_commits_the_page_through_the_receiver_loop() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let checkpoint = CheckpointConfig {
+        directory: directory.path().to_string_lossy().into_owned(),
+        on_nack: OnNack::Rewind,
+        nack_backoff: Duration::from_millis(10),
+        max_consecutive_failures: 3,
+    };
+    let store = CheckpointStore::new(
+        directory.path(),
+        "group",
+        "pipeline",
+        "fake",
+        "fake-source",
+        "fingerprint".to_owned(),
+    );
+    let lease = SourceLease::acquire(&store.lease_key()).expect("source lease");
+    let receiver: DatabaseReceiver<FakeAdapter> = DatabaseReceiver::new(
+        FakeAdapter,
+        fake_query(&checkpoint),
+        store.clone(),
+        lease,
+        checkpoint.nack_backoff,
+        checkpoint.max_consecutive_failures,
+        "fake-source".to_owned(),
+        None,
+    );
+    let test_runtime = TestRuntime::<OtapPdata>::new();
+    let node_config = Arc::new(NodeUserConfig::new_receiver_config(
+        "urn:otel:receiver:database_test",
+    ));
+    let wrapper = ReceiverWrapper::local(
+        receiver,
+        test_node(test_runtime.config().name.clone()),
+        node_config,
+        test_runtime.config(),
+    );
+
+    test_runtime
+        .set_receiver(wrapper)
+        .run_test(|_| async {})
+        .run_validation_concurrent(|mut ctx| async move {
+            let pdata = ctx.recv().await.expect("receiver should emit one page");
+            let (_, ack) = next_ack(AckMsg::new(pdata)).expect("ACK subscription frame");
+            ctx.send_control_msg(NodeControlMsg::Ack(ack))
+                .await
+                .expect("ACK should enqueue");
+            ctx.send_control_msg(NodeControlMsg::Shutdown {
+                deadline: Instant::now() + Duration::from_secs(1),
+                reason: "checkpoint committed".to_owned(),
+            })
+            .await
+            .expect("shutdown should enqueue");
+        });
+
+    let committed = store
+        .read()
+        .expect("checkpoint should be readable")
+        .expect("ACK should install a checkpoint");
+    assert_eq!(committed.revision, 1);
+    assert_eq!(committed.cursor.tie_breaker, 1);
+}

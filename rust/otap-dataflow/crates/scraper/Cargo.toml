@@ -24,7 +24,9 @@ otel-arrow-dfe-telemetry.workspace = true
 otel-arrow-dfe-telemetry-macros.workspace = true
 
 async-trait.workspace = true
+blake3.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 humantime-serde.workspace = true
 prost.workspace = true
 serde.workspace = true
@@ -37,4 +39,5 @@ otel-arrow-dfe-config.workspace = true
 otel-arrow-dfe-engine = { workspace = true, features = ["test-utils"] }
 otel-arrow-dfe-otap = { workspace = true, features = ["test-utils"] }
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

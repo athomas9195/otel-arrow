@@ -14,6 +14,7 @@ use crate::database::{
 };
 use crate::progress::{CheckpointBackend, CheckpointState, SourceOwnership};
 use crate::telemetry::DatabaseReceiverMetrics;
+use crate::{CheckpointStore, SourceLease};
 use async_trait::async_trait;
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_engine::control::{CallData, Context8u8, NodeControlMsg};
@@ -79,7 +80,7 @@ impl<L> Drop for HeldOwnership<L> {
 }
 
 /// Executes one compiled query through a database-specific adapter.
-pub struct DatabaseReceiver<A, S, L> {
+pub struct DatabaseReceiver<A, S = CheckpointStore, L = SourceLease> {
     adapter: A,
     query: CompiledQuery,
     checkpoint: S,
