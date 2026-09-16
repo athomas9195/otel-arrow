@@ -7926,11 +7926,20 @@ name = "otel-arrow-dfe-scraper"
 version = "0.56.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "humantime-serde",
+ "otel-arrow-dfe-channel",
+ "otel-arrow-dfe-config",
  "otel-arrow-dfe-engine",
+ "otel-arrow-dfe-otap",
+ "otel-arrow-dfe-pdata",
+ "otel-arrow-dfe-telemetry",
+ "otel-arrow-dfe-telemetry-macros",
+ "prost 0.14.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
