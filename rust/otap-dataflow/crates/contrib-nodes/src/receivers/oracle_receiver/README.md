@@ -158,7 +158,7 @@ configured initial pair; subsequent polls use the last committed pair.
 | `watermark.mode` | string | **required** | Must be `composite`; `scalar` and `snapshot` are not implemented. |
 | `watermark.timestamp.column` | string | **required** | Unquoted Oracle identifier for the timestamp cursor column. |
 | `watermark.timestamp.bind` | string | **required** | Named parameter without `:`. ASCII letters, digits, and `_` only, starting with a letter or `_`. |
-| `watermark.timestamp.initial` | string | **required** | Timestamp text parseable by the Oracle driver, such as `"1970-01-01 00:00:00"`. Used only when no checkpoint exists. |
+| `watermark.timestamp.initial` | string | **required** | Oracle timestamp text, such as `"1970-01-01 00:00:00"`, with at most nine digits per numeric component. Fractional precision above nine digits is rejected, not truncated. Used only when no checkpoint exists. |
 | `watermark.timestamp.timezone` | string | **required** | Must be `UTC`, ignoring ASCII case. The adapter sets its Oracle session timezone to UTC. |
 | `watermark.tie_breaker.column` | string | **required** | Unquoted Oracle identifier for the signed integer tie-breaker column. |
 | `watermark.tie_breaker.bind` | string | **required** | Named parameter with the same syntax as the timestamp bind. |

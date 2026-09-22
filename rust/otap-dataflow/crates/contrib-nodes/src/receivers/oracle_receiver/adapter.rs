@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 static ORACLE_CLIENT_DIRECTORY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 const MAX_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_TIMESTAMP_COMPONENT_DIGITS: usize = 9;
 
 #[derive(Clone)]
 pub(crate) struct OracleAdapterConfig {
@@ -403,8 +404,7 @@ fn bind_cursor<'a>(
     cursor: &CompositeCursor,
 ) -> Result<oracle::ResultSet<'a, OracleRow>, OracleAdapterError> {
     let watermark = query.watermark();
-    let timestamp = Timestamp::from_str(&cursor.timestamp)
-        .map_err(|error| OracleAdapterError::InvalidCursorTimestamp(error.to_string()))?;
+    let timestamp = parse_cursor_timestamp(&cursor.timestamp)?;
     // Bind with timezone information even for DATE and timezone-naive
     // TIMESTAMP columns. The session is UTC, so a naive cursor binds as
     // +00:00, while a TIMESTAMP WITH TIME ZONE cursor retains its source
@@ -418,6 +418,27 @@ fn bind_cursor<'a>(
             (watermark.tie_breaker_bind.as_str(), &tie_breaker),
         ])
         .map_err(OracleAdapterError::Query)
+}
+
+/// Parses cursor text without overflow or lossy numeric narrowing in the driver.
+pub(super) fn parse_cursor_timestamp(text: &str) -> Result<Timestamp, OracleAdapterError> {
+    // oracle 0.6.3 uses unchecked numeric accumulation and narrowing casts.
+    // Nine digits fit every intermediate type and avoid fractional truncation.
+    let mut digits = 0;
+    for byte in text.bytes() {
+        if byte.is_ascii_digit() {
+            digits += 1;
+            if digits > MAX_TIMESTAMP_COMPONENT_DIGITS {
+                return Err(OracleAdapterError::InvalidCursorTimestamp(
+                    "timestamp numeric component exceeds nine digits".to_owned(),
+                ));
+            }
+        } else {
+            digits = 0;
+        }
+    }
+    Timestamp::from_str(text)
+        .map_err(|error| OracleAdapterError::InvalidCursorTimestamp(error.to_string()))
 }
 
 /// Uses a timezone-aware bind so checkpoint offsets survive round trips.

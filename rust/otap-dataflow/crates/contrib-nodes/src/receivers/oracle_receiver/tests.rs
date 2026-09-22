@@ -108,7 +108,7 @@ fn rejects_obsolete_normalized_byte_limit() {
     assert!(
         error
             .to_string()
-            .contains("unknown field `max_normalized_bytes`")
+            .contains("invalid Oracle receiver configuration")
     );
 }
 
@@ -283,6 +283,79 @@ fn rejects_invalid_initial_timestamp() {
     config["watermark"]["timestamp"]["initial"] = serde_json::json!("not-a-timestamp");
 
     assert!(parsed(config).is_err());
+}
+
+/// Scenario: Initial timestamp components overflow or narrow in the native parser, or exceed its precision.
+/// Guarantees: Configuration returns a field-specific error without panicking or changing the initial position.
+#[test]
+fn rejects_oversized_or_wrapping_initial_timestamps() {
+    for initial in [
+        "9".repeat(40),
+        "4294969322-01-01 00:00:00".to_owned(),
+        "2026-4294967297-01 00:00:00".to_owned(),
+        "2026-01-01 00:00:00.1234567890".to_owned(),
+        "2026-01-01 00:00:00 +4294967297:00".to_owned(),
+    ] {
+        let mut config = documented_config();
+        config["watermark"]["timestamp"]["initial"] = serde_json::json!(initial);
+        let error = parsed(config).err().expect("unsafe timestamp must fail");
+        assert!(error.to_string().contains("watermark.timestamp.initial"));
+    }
+}
+
+/// Scenario: Nested comparisons satisfy token checks but the only top-level WHERE occurs after ORDER BY.
+/// Guarantees: Invalid clause ordering returns an error instead of panicking during predicate slicing.
+#[test]
+fn rejects_where_after_order_without_panicking() {
+    let mut config = documented_config();
+    config["watermark"]["timestamp"]["column"] = serde_json::json!("WHERE");
+    config["query"]["statement"] = serde_json::json!(
+        "SELECT (WHERE > :last_timestamp), (WHERE = :last_timestamp), \
+         (AUDIT_ID > :last_tie_breaker) FROM AUDIT_LOGS \
+         ORDER BY WHERE ASC, AUDIT_ID ASC"
+    );
+    let error = parsed(config).err().expect("misordered clauses must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("WHERE predicate before ORDER BY")
+    );
+}
+
+/// Scenario: Malformed fields, enum values, and unknown keys contain sensitive configuration text.
+/// Guarantees: Neither deserialization errors nor engine diagnostics expose those supplied values.
+#[test]
+fn configuration_errors_redact_supplied_values() {
+    use otel_arrow_dfe_engine::error::{Error, error_summary_from};
+
+    const SENTINEL: &str = "PRIVATE_CONFIGURATION_SENTINEL";
+    let mut invalid_cursor = documented_config();
+    invalid_cursor["watermark"]["tie_breaker"]["initial"] = serde_json::json!(SENTINEL);
+    let mut invalid_mode = documented_config();
+    invalid_mode["watermark"]["mode"] = serde_json::json!(SENTINEL);
+    let mut invalid_authentication = documented_config();
+    invalid_authentication["authentication"] = serde_json::json!(SENTINEL);
+    let mut unknown_field = documented_config();
+    unknown_field["query"][SENTINEL] = serde_json::json!(SENTINEL);
+
+    for config in [
+        invalid_cursor,
+        invalid_mode,
+        invalid_authentication,
+        unknown_field,
+    ] {
+        let direct_error = parsed(config.clone()).err().expect("invalid schema");
+        assert!(!direct_error.to_string().contains(SENTINEL));
+        let error = (ORACLE_RECEIVER.validate_config)(&config).expect_err("invalid schema");
+        let engine = Error::ConfigError(Box::new(error));
+        for rendered in [
+            engine.to_string(),
+            format!("{engine:?}"),
+            serde_json::to_string(&error_summary_from(&engine)).expect("diagnostic JSON"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+        }
+    }
 }
 
 /// Scenario: A statement's final ordering is descending, reordered, missing, or only nested

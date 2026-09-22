@@ -10,13 +10,12 @@
 //! bind-name prefixes, and orderings nested inside parentheses never satisfy
 //! that requirement.
 
-use super::adapter::{OracleAdapter, OracleAdapterConfig};
+use super::adapter::{OracleAdapter, OracleAdapterConfig, parse_cursor_timestamp};
 use otel_arrow_dfe_scraper::database::{
     CheckpointConfig, CompiledQuery, OutputConfig, PollingConfig, WatermarkConfig,
 };
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::str::FromStr;
 use std::time::Duration;
 
 const MAX_SOURCE_ID_BYTES: usize = 256;
@@ -24,8 +23,6 @@ const MIN_ORACLE_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_ORACLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Validated configuration for one Oracle composite-watermark query.
-#[derive(Deserialize)]
-#[serde(try_from = "RawOracleConfig")]
 pub struct OracleReceiverConfig {
     source_id: String,
     connection: OracleConnectionConfig,
@@ -33,6 +30,21 @@ pub struct OracleReceiverConfig {
     query: CompiledQuery,
     checkpoint: CheckpointConfig,
     config_fingerprint: String,
+}
+
+impl<'de> Deserialize<'de> for OracleReceiverConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Structural Serde errors can quote SQL, credentials, and cursor values.
+        let raw = RawOracleConfig::deserialize(deserializer).map_err(|_| {
+            D::Error::custom(
+                "invalid Oracle receiver configuration: check required fields, field names, types, and enum values",
+            )
+        })?;
+        Self::try_from(raw).map_err(D::Error::custom)
+    }
 }
 
 impl OracleReceiverConfig {
@@ -119,12 +131,11 @@ impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
             "watermark.tie_breaker.column",
             &config.watermark.tie_breaker().column,
         )?;
-        let initial = oracle::sql_type::Timestamp::from_str(&config.watermark.timestamp().initial)
-            .map_err(|error| {
-                OracleConfigError::new(format!(
-                    "watermark.timestamp.initial is not a valid Oracle timestamp: {error}"
-                ))
-            })?;
+        let initial = parse_cursor_timestamp(&config.watermark.timestamp().initial).map_err(|_| {
+            OracleConfigError::new(
+                "watermark.timestamp.initial must be a valid Oracle timestamp with at most nine digits per numeric component",
+            )
+        })?;
         let WatermarkConfig::Composite { timestamp, .. } = &mut config.watermark;
         timestamp.initial = initial.to_string();
         let statement = validate_statement(&config.query.statement, &config.watermark)?;
@@ -346,6 +357,11 @@ fn validate_statement(
         .ok_or_else(|| {
             OracleConfigError::new("query.statement requires a top-level WHERE predicate")
         })?;
+    if where_index >= order {
+        return Err(OracleConfigError::new(
+            "query.statement requires a top-level WHERE predicate before ORDER BY",
+        ));
+    }
     let predicate = tokens[where_index + 1..order]
         .iter()
         .map(|token| token.text.as_str())

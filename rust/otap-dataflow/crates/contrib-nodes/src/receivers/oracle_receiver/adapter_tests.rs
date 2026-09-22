@@ -3,7 +3,8 @@
 
 use super::{
     CellValue, OracleAdapterError, OracleType, bounded_connect_string, cursor_bind_type,
-    finite_float, read_credential, validate_described_cursor_columns, validate_types,
+    finite_float, parse_cursor_timestamp, read_credential, validate_described_cursor_columns,
+    validate_types,
 };
 use oracle::sql_type::Timestamp;
 use otel_arrow_dfe_scraper::database::{CompositeCursor, CompositeWatermark};
@@ -240,7 +241,23 @@ fn timezone_aware_cursor_uses_a_timezone_aware_bind() {
 /// interpolated into SQL or silently reset to the initial cursor.
 #[test]
 fn rejects_uninterpretable_cursor_timestamps() {
-    assert!(Timestamp::from_str("not-a-timestamp").is_err());
+    assert!(parse_cursor_timestamp("not-a-timestamp").is_err());
+}
+
+/// Scenario: Configured or checkpointed cursor text contains oversized numeric components.
+/// Guarantees: The shared Oracle parsing boundary rejects overflow, narrowing, and precision loss.
+#[test]
+fn cursor_parser_rejects_oversized_numeric_components() {
+    for text in [
+        "9".repeat(40),
+        "4294969322-01-01 00:00:00".to_owned(),
+        "2026-01-01 00:00:00.1234567890".to_owned(),
+    ] {
+        assert!(matches!(
+            parse_cursor_timestamp(&text),
+            Err(OracleAdapterError::InvalidCursorTimestamp(_))
+        ));
+    }
 }
 
 /// Scenario: Oracle returns a non-finite binary floating-point value.
