@@ -44,8 +44,8 @@ exactly once and does not implement every capability proposed in the
 4. Adapt the [complete pipeline example](#full-configuration), then use the
    [Windows or Linux commands](#running) to start it on one core.
 
-Fields marked **required** must be provided. Only the optional catch-up budgets
-have defaults. Unknown fields are rejected.
+Fields marked **required** must be provided. Collection interval, query timeout,
+fetch size and catch-up budgets have defaults. Unknown fields are rejected.
 
 ## Configuration
 
@@ -129,17 +129,23 @@ your Oracle client and connection security separately for the deployment.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `query.statement` | string | **required** | One SELECT in the [supported query shape](#required-query-shape), at most 16 KiB after trimming the optional trailing semicolon and surrounding whitespace. |
-| `query.interval` | duration string | **required** | Between `1ms` and `24h`, inclusive. Delay after a poll cycle ends; acknowledged catch-up pages do not wait this interval. |
-| `query.fetch_size` | integer | **required** | Between `1` and `10000`, and no greater than `max_rows_per_poll`. Target native fetch size, further capped by row and byte budgets. |
+| `query.interval` | duration string | `1m` | Between `1m` and `24h`, inclusive, with whole-second precision. `1.5m` is valid (90 seconds); `60.5s` is not. Delay after a poll cycle ends; acknowledged catch-up pages do not wait this interval. |
+| `query.fetch_size` | integer | `300` | Between `1` and `10000`, and no greater than `max_rows_per_poll`. Target rows per native fetch, further capped by row and byte budgets. |
 | `query.max_rows_per_poll` | integer | **required** | Between `1` and `10000`. Maximum rows fetched per page, including catch-up pages. |
 | `query.max_batch_bytes` | byte count or size string | **required** | Between 1 byte and 256 MiB, inclusive. For example, `10485760` or `10 MiB`. Applied separately to normalized row storage and encoded OTLP. |
-| `query.timeout` | duration string | **required** | Between `1ms` and `5m`, inclusive. Native Oracle call timeout, not a whole-poll or downstream-ACK deadline. |
+| `query.timeout` | duration string | `30s` | Positive whole seconds from `1s` through `5m`. Native Oracle call timeout, not a whole-query, whole-poll or downstream-ACK deadline. |
 | `query.catch_up.max_pages` | integer | `32` | Between `1` and `1024`. Maximum page fetches per cycle, including empty probes. Set to `1` for single-page cycles. |
 | `query.catch_up.max_duration` | duration string | `10s` | Between `1ms` and `5m`. Elapsed cycle budget for admitting another fetch, not an in-flight query deadline. |
 
 Catch-up remains ACK-gated with one pending page. It stops on an empty page,
 budget exhaustion, downstream admission pressure, or a stop request. The receiver
 also observes the pipeline's process-memory admission state.
+
+Omitting the three operational settings selects `interval: 1m`, `timeout: 30s`,
+and `fetch_size: 300`. Explicit blank, null, negative or invalid values are
+rejected, not replaced with defaults or rounded. A configured page limit below
+300 requires an explicitly smaller fetch size. Product configuration may hold
+the timeout and fetch size fixed while still using these native defaults.
 
 There is no independent `query.max_normalized_bytes` setting. For example,
 `max_batch_bytes: 10 MiB` caps each of the normalized-row and encoded-payload
@@ -455,11 +461,11 @@ groups:
                     )
                   )
                   ORDER BY EVENT_TS ASC, EVENT_ID ASC
-                interval: 5m
-                fetch_size: 1000
+                interval: 1m
+                fetch_size: 300
                 max_rows_per_poll: 10000
                 max_batch_bytes: 10 MiB
-                timeout: 2m
+                timeout: 30s
               watermark:
                 mode: composite
                 timestamp:

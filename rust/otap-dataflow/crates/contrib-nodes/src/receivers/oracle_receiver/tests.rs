@@ -27,11 +27,11 @@ fn documented_config() -> Value {
         },
         "query": {
             "statement": COMPOSITE_STATEMENT,
-            "interval": "5m",
-            "fetch_size": 1000,
+            "interval": "1m",
+            "fetch_size": 300,
             "max_rows_per_poll": 10000,
             "max_batch_bytes": "10 MiB",
-            "timeout": "2m"
+            "timeout": "30s"
         },
         "watermark": {
             "mode": "composite",
@@ -213,7 +213,7 @@ fn accepts_the_documented_composite_configuration() {
 }
 
 /// Scenario: Required watermark, checkpoint, or byte-limit sections are omitted.
-/// Guarantees: Every operational bound and cursor field stays explicit, so a receiver can never
+/// Guarantees: Required page bounds and cursor fields stay explicit, so a receiver can never
 /// silently run without a durable checkpoint or a byte ceiling.
 #[test]
 fn requires_every_operational_and_cursor_field() {
@@ -228,13 +228,7 @@ fn requires_every_operational_and_cursor_field() {
             "required section '{section}' must not be optional"
         );
     }
-    for field in [
-        "interval",
-        "fetch_size",
-        "max_rows_per_poll",
-        "max_batch_bytes",
-        "timeout",
-    ] {
+    for field in ["max_rows_per_poll", "max_batch_bytes"] {
         let mut config = documented_config();
         _ = config["query"]
             .as_object_mut()
@@ -251,6 +245,97 @@ fn requires_every_operational_and_cursor_field() {
         .expect("checkpoint object")
         .remove("nack_backoff");
     assert!(parsed(config).is_err());
+}
+
+/// Scenario: Collection interval, timeout and fetch size are omitted or explicitly set to their defaults.
+/// Guarantees: Both configurations use 60s/30s/300 rows and preserve the same checkpoint compatibility fingerprint.
+#[test]
+fn collection_defaults_are_applied_without_changing_checkpoint_identity() {
+    let mut omitted = documented_config();
+    for field in ["interval", "timeout", "fetch_size"] {
+        _ = omitted["query"]
+            .as_object_mut()
+            .expect("query")
+            .remove(field);
+    }
+    let mut explicit = omitted.clone();
+    explicit["query"]["interval"] = serde_json::json!("1m");
+    explicit["query"]["timeout"] = serde_json::json!("30s");
+    explicit["query"]["fetch_size"] = serde_json::json!(300);
+    let defaults = parsed(omitted).expect("default collection settings");
+    let configured = parsed(explicit).expect("explicit default settings");
+    for config in [&defaults, &configured] {
+        assert_eq!(config.query().interval(), Duration::from_secs(60));
+        assert_eq!(config.query().timeout(), Duration::from_secs(30));
+        assert_eq!(config.query().fetch_size(), 300);
+    }
+    assert_eq!(
+        defaults.config_fingerprint(),
+        configured.config_fingerprint()
+    );
+}
+
+/// Scenario: The interval uses supported endpoints or fractional minutes equivalent to whole seconds.
+/// Guarantees: Values from one minute through 24 hours are preserved exactly without rounding.
+#[test]
+fn collection_interval_accepts_whole_seconds_and_fractional_minutes() {
+    for (value, seconds) in [("1m", 60), ("1.5m", 90), ("61s", 61), ("24h", 86400)] {
+        let mut config = documented_config();
+        config["query"]["interval"] = serde_json::json!(value);
+        assert_eq!(
+            parsed(config).expect("valid interval").query().interval(),
+            Duration::from_secs(seconds)
+        );
+    }
+}
+
+/// Scenario: Collection settings contain nulls, blanks, non-integral values, or unsupported limits.
+/// Guarantees: Invalid values fail configuration instead of receiving defaults or silent rounding.
+#[test]
+fn collection_settings_reject_invalid_values() {
+    for field in ["interval", "timeout", "fetch_size"] {
+        for value in [Value::Null, serde_json::json!("")] {
+            let mut config = documented_config();
+            config["query"][field] = value;
+            assert!(parsed(config).is_err(), "{field}");
+        }
+    }
+    for (field, value) in [
+        ("interval", "0s"),
+        ("interval", "59s"),
+        ("interval", "60.5s"),
+        ("interval", "24h 1s"),
+        ("interval", "-1m"),
+        ("timeout", "0s"),
+        ("timeout", "-1s"),
+        ("timeout", "0.5s"),
+        ("timeout", "30.5s"),
+        ("timeout", "301s"),
+    ] {
+        let mut config = documented_config();
+        config["query"][field] = serde_json::json!(value);
+        assert!(parsed(config).is_err(), "{field}={value}");
+    }
+    for value in [
+        serde_json::json!(0),
+        serde_json::json!(-1),
+        serde_json::json!(0.5),
+        serde_json::json!(10001),
+    ] {
+        let mut config = documented_config();
+        config["query"]["fetch_size"] = value;
+        assert!(parsed(config).is_err());
+    }
+    let mut config = documented_config();
+    config["query"]["max_rows_per_poll"] = serde_json::json!(100);
+    _ = config["query"]
+        .as_object_mut()
+        .expect("query")
+        .remove("fetch_size");
+    assert!(
+        parsed(config).is_err(),
+        "default fetch size still obeys explicit page bounds"
+    );
 }
 
 /// Scenario: A statement omits a bind, or references one only inside a literal or as a prefix.
@@ -486,8 +571,8 @@ fn rejects_undocumented_oracle_query_fields() {
     }
 }
 
-/// Scenario: Oracle configuration uses an unsupported call timeout.
-/// Guarantees: Sub-millisecond and excessively long timeouts fail before opening a connection.
+/// Scenario: Oracle configuration uses an unsupported query timeout.
+/// Guarantees: Fractional-second and excessively long timeouts fail before opening a connection.
 #[test]
 fn rejects_unsupported_oracle_timeouts() {
     for timeout in ["500us", "6m"] {
@@ -595,7 +680,7 @@ fn emits_oracle_rows_when_live_test_is_enabled() {
             "statement": "SELECT EVENT_ID, EVENT_TS, PAYLOAD FROM OTAP_ORACLE_EVENTS \
                 WHERE (EVENT_TS > :last_timestamp OR (EVENT_TS = :last_timestamp \
                 AND EVENT_ID > :last_tie_breaker)) ORDER BY EVENT_TS ASC, EVENT_ID ASC",
-            "interval": "100ms",
+            "interval": "1m",
             "fetch_size": 10,
             "max_rows_per_poll": 10,
             "max_batch_bytes": "10 MiB",

@@ -19,8 +19,22 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
 
 const MAX_SOURCE_ID_BYTES: usize = 256;
-const MIN_ORACLE_TIMEOUT: Duration = Duration::from_millis(1);
+const MIN_ORACLE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_ORACLE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MIN_ORACLE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ORACLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+const fn default_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+const fn default_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+const fn default_fetch_size() -> usize {
+    300
+}
 
 /// Validated configuration for one Oracle composite-watermark query.
 pub struct OracleReceiverConfig {
@@ -115,9 +129,18 @@ impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
             &config.authentication.password_file,
         )?;
         required("query.statement", &config.query.statement)?;
-        if !(MIN_ORACLE_TIMEOUT..=MAX_ORACLE_TIMEOUT).contains(&config.query.timeout) {
+        if !(MIN_ORACLE_INTERVAL..=MAX_ORACLE_INTERVAL).contains(&config.query.interval)
+            || config.query.interval.subsec_nanos() != 0
+        {
             return Err(OracleConfigError::new(
-                "query.timeout must be between 1ms and 5m",
+                "query.interval must be between 1 minute and 24 hours in whole seconds",
+            ));
+        }
+        if !(MIN_ORACLE_TIMEOUT..=MAX_ORACLE_TIMEOUT).contains(&config.query.timeout)
+            || config.query.timeout.subsec_nanos() != 0
+        {
+            return Err(OracleConfigError::new(
+                "query.timeout must be between 1s and 5m in whole seconds",
             ));
         }
         config.query.polling().validate()?;
@@ -225,13 +248,14 @@ struct OracleAuthenticationConfig {
 #[serde(deny_unknown_fields)]
 struct OracleQueryConfig {
     statement: String,
-    #[serde(with = "humantime_serde")]
+    #[serde(default = "default_interval", with = "humantime_serde")]
     interval: Duration,
+    #[serde(default = "default_fetch_size")]
     fetch_size: usize,
     max_rows_per_poll: usize,
     #[serde(deserialize_with = "deserialize_byte_size")]
     max_batch_bytes: u64,
-    #[serde(with = "humantime_serde")]
+    #[serde(default = "default_timeout", with = "humantime_serde")]
     timeout: Duration,
     #[serde(default)]
     catch_up: CatchUpConfig,
