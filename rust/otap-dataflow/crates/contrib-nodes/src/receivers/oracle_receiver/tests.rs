@@ -637,9 +637,12 @@ fn emits_oracle_rows_when_live_test_is_enabled() {
         .set_receiver(receiver_wrapper)
         .run_test(|ctx| async move {
             ctx.sleep(Duration::from_millis(500)).await;
-            ctx.send_shutdown(Instant::now(), "Oracle receiver E2E complete")
-                .await
-                .expect("shutdown should enqueue");
+            ctx.send_shutdown(
+                Instant::now() + Duration::from_secs(5),
+                "Oracle receiver E2E complete",
+            )
+            .await
+            .expect("shutdown should enqueue");
         })
         .run_validation(|mut ctx| async move {
             let mut pdata = ctx.recv().await.expect("receiver should emit pdata");
