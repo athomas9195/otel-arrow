@@ -9,7 +9,7 @@ releases.
 
 - Type: `urn:otel:receiver:oracle`
 - Crate: `otel-arrow-dfe-contrib-nodes`
-- Feature gate: `oracle-receiver` (also enabled by `contrib-receivers`)
+- Feature gate: `oracle-receiver` (opt-in; not enabled by `contrib-receivers`)
 - Stability: Experimental
 - Output: OTLP logs, one log record per selected database row
 - Execution: One query per receiver, in a single-core pipeline

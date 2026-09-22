@@ -103,9 +103,11 @@ contrib-nodes = ["contrib-receivers", "contrib-processors", "contrib-exporters"]
 contrib-receivers = [
     "etw",
     "kafka",
-    "oracle-receiver",
     "user-events",
 ]
+# Oracle is explicitly opt-in and excluded from the contrib umbrella features.
+# It includes the `oracle` driver; Oracle Client libraries such as Instant Client
+# must be provided separately and are loaded at runtime.
 contrib-processors = [
     "condense-attributes",
     "recordset-kql",
