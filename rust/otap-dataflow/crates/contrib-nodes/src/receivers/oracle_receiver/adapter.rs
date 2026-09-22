@@ -33,6 +33,13 @@ pub(crate) struct OracleAdapterConfig {
 }
 
 /// Oracle adapter that reuses one connection across non-overlapping polls.
+///
+/// A long-lived `spawn_blocking` worker owns the session and prepared statement;
+/// cancellation temporarily shares a connection handle to interrupt active work.
+/// [`DriverAdapter::shutdown`] closes the work channel and awaits worker cleanup.
+/// Dropping the adapter without shutdown closes the channel but does not join
+/// the worker. Cleanup remains worker-owned; stuck native work can prevent it
+/// from completing.
 pub struct OracleAdapter {
     config: OracleAdapterConfig,
     worker: Option<std::sync::mpsc::SyncSender<OracleWork>>,
@@ -84,9 +91,9 @@ impl OracleAdapter {
     where
         T: Send + 'static,
     {
-        // A single bounded dedicated worker owns the native session permanently,
-        // including statement/connection destruction when the sender is dropped.
-        // No Oracle destructor can therefore run on the pipeline thread.
+        // Run synchronous query jobs serially on a blocking worker with a
+        // capacity-one queue. Retain the session here between polls and drop
+        // it here once queued work finishes and the channel closes.
         if self.worker.is_none() {
             let (sender, receiver) = std::sync::mpsc::sync_channel::<OracleWork>(1);
             self.worker_join = Some(tokio::task::spawn_blocking(move || {
@@ -99,6 +106,7 @@ impl OracleAdapter {
             self.worker = Some(sender);
         }
         let worker = self.worker.as_ref().expect("worker initialized");
+        // Clone inputs so queued work owns its data and can outlive this future.
         let config = self.config.clone();
         let query = query.clone();
         let cursor = cursor.clone();
@@ -246,6 +254,10 @@ impl DriverAdapter for OracleAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), Self::Error> {
+        // Close the job channel and await worker exit, including session cleanup.
+        // This does not interrupt a running native call. The controller bounds
+        // this wait on normal/error loop exits and retains the lease if cleanup
+        // cannot be joined.
         drop(self.worker.take());
         if let Some(worker) = self.worker_join.take() {
             worker.await.map_err(OracleAdapterError::Worker)?;
