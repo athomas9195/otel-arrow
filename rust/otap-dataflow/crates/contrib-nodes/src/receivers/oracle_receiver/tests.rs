@@ -31,7 +31,6 @@ fn documented_config() -> Value {
             "fetch_size": 1000,
             "max_rows_per_poll": 10000,
             "max_batch_bytes": "10 MiB",
-            "max_normalized_bytes": "5 MiB",
             "timeout": "2m"
         },
         "watermark": {
@@ -69,20 +68,48 @@ fn with_statement(statement: &str) -> Value {
 fn rejects_composite_predicate_lookalikes_and_set_operations() {
     for statement in [
         "SELECT AUDIT_ID, LAST_UPDATED FROM AUDIT_LOGS WHERE LAST_UPDATED > :last_timestamp AND (LAST_UPDATED = :last_timestamp OR AUDIT_ID > :last_tie_breaker) ORDER BY LAST_UPDATED ASC, AUDIT_ID ASC",
-        "SELECT AUDIT_ID, LAST_UPDATED FROM AUDIT_LOGS WHERE LAST_UPDATED > :last_timestamp OR (LAST_UPDATED = :last_timestamp AND AUDIT_ID > :last_tie_breaker) UNION ALL SELECT AUDIT_ID, LAST_UPDATED FROM AUDIT_LOGS ORDER BY LAST_UPDATED ASC, AUDIT_ID ASC",
         "SELECT AUDIT_ID, LAST_UPDATED FROM AUDIT_LOGS WHERE LAST_UPDATED > :last_timestamp OR (LAST_UPDATED = :last_timestamp AND AUDIT_ID > :last_tie_breaker) OR 1 = 1 ORDER BY LAST_UPDATED ASC, AUDIT_ID ASC",
     ] {
         assert!(parsed(with_statement(statement)).is_err());
     }
+    for operation in ["UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT"] {
+        let statement = COMPOSITE_STATEMENT.replacen(
+            " ORDER BY",
+            &format!(
+                " {operation} SELECT AUDIT_ID, LAST_UPDATED, PAYLOAD FROM AUDIT_LOGS ORDER BY"
+            ),
+            1,
+        );
+        for statement in [statement.clone(), statement.to_ascii_lowercase()] {
+            assert!(parsed(with_statement(&statement)).is_err(), "{statement}");
+        }
+    }
 }
 
-/// Scenario: Encoded payload and normalized storage limits are configured independently.
-/// Guarantees: Both ceilings survive deserialization and query compilation without aliasing.
+/// Scenario: Native Oracle configuration supplies only the original max_batch_bytes setting.
+/// Guarantees: It parses without an additional field and uses that limit for both row storage and encoding.
 #[test]
-fn preserves_independent_byte_limits() {
+fn uses_one_byte_limit_for_rows_and_encoding() {
     let config = parsed(documented_config()).expect("configuration");
     assert_eq!(config.query().max_batch_bytes(), 10 * 1024 * 1024);
-    assert_eq!(config.query().max_normalized_bytes(), 5 * 1024 * 1024);
+    assert_eq!(
+        config.query().max_normalized_bytes(),
+        config.query().max_batch_bytes()
+    );
+}
+
+/// Scenario: Configuration includes the removed independent normalized-row byte setting.
+/// Guarantees: The obsolete field is rejected rather than silently ignored.
+#[test]
+fn rejects_obsolete_normalized_byte_limit() {
+    let mut config = documented_config();
+    config["query"]["max_normalized_bytes"] = serde_json::json!("5 MiB");
+    let error = parsed(config).err().expect("obsolete field must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown field `max_normalized_bytes`")
+    );
 }
 
 /// Scenario: Oracle accepts date-only and timezone-naive ISO initial timestamps.
@@ -114,6 +141,31 @@ fn pipeline_context() -> PipelineContext {
         1,
         0,
     )
+}
+
+/// Scenario: The engine attempts to create the unpartitioned Oracle receiver on two cores.
+/// Guarantees: Factory validation rejects duplicate per-core pollers before acquiring a lease.
+#[test]
+fn factory_rejects_multi_core_placement() {
+    let pipeline = ControllerContext::new(TelemetryRegistryHandle::new()).pipeline_context_with(
+        "group".into(),
+        "pipeline".into(),
+        0,
+        2,
+        0,
+    );
+    let runtime = TestRuntime::<OtapPdata>::new();
+    let result = (ORACLE_RECEIVER.create)(
+        pipeline,
+        test_node("oracle-test"),
+        Arc::new(NodeUserConfig::new_receiver_config(ORACLE_RECEIVER_URN)),
+        runtime.config(),
+        &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+    );
+    assert!(matches!(
+        result,
+        Err(ConfigError::InvalidUserConfig { error }) if error.contains("single-core")
+    ));
 }
 
 /// Scenario: The receiver loads the complete documented composite configuration.
@@ -267,9 +319,8 @@ fn requires_the_final_outer_ascending_ordering() {
     assert!(parsed(with_statement(nested_then_wrong_outer)).is_err());
 }
 
-/// Scenario: A statement contains SQL comments or more than one statement.
-/// Guarantees: Comment and statement-separator syntax cannot hide a second statement or comment
-/// out the validated ordering clause.
+/// Scenario: A statement contains SQL comments or appends a second SELECT or DELETE.
+/// Guarantees: Extra statements and comments are rejected before any database execution.
 #[test]
 fn rejects_comments_and_multiple_statements() {
     let commented = "SELECT AUDIT_ID, LAST_UPDATED FROM AUDIT_LOGS \
@@ -277,8 +328,29 @@ fn rejects_comments_and_multiple_statements() {
          AND AUDIT_ID > :last_tie_breaker) ORDER BY LAST_UPDATED ASC, AUDIT_ID ASC -- trailing";
     assert!(parsed(with_statement(commented)).is_err());
 
-    let multiple = format!("{COMPOSITE_STATEMENT}; SELECT 1 FROM DUAL");
-    assert!(parsed(with_statement(&multiple)).is_err());
+    for statement in [
+        format!("{COMPOSITE_STATEMENT}; SELECT 1 FROM DUAL"),
+        format!("{COMPOSITE_STATEMENT}; DELETE FROM AUDIT_LOGS"),
+        "SELECT 1; DELETE FROM audit_logs".to_owned(),
+    ] {
+        assert!(parsed(with_statement(&statement)).is_err(), "{statement}");
+    }
+}
+
+/// Scenario: An otherwise valid watermark query adds an Oracle row-locking clause.
+/// Guarantees: FOR UPDATE variants are rejected before connecting or acquiring row locks.
+#[test]
+fn rejects_row_locking_selects() {
+    for clause in [
+        "FOR UPDATE",
+        "FOR UPDATE OF AUDIT_ID",
+        "FOR UPDATE NOWAIT",
+        "FOR UPDATE SKIP LOCKED",
+        "for update wait 1",
+    ] {
+        let statement = format!("{COMPOSITE_STATEMENT} {clause}");
+        assert!(parsed(with_statement(&statement)).is_err(), "{statement}");
+    }
 }
 
 /// Scenario: A valid composite statement uses a trailing semicolon and extra surrounding spacing.
@@ -426,7 +498,6 @@ fn emits_oracle_rows_when_live_test_is_enabled() {
             "fetch_size": 10,
             "max_rows_per_poll": 10,
             "max_batch_bytes": "10 MiB",
-            "max_normalized_bytes": "5 MiB",
             "timeout": "10s"
         },
         "watermark": {

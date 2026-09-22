@@ -919,7 +919,10 @@ fn finite_float(value: CellValue) -> Result<CellValue, OracleAdapterError> {
 }
 
 /// Oracle connection, query, or conversion failure.
-#[derive(Debug, thiserror::Error)]
+///
+/// Native error messages may contain SQL, endpoint, row, or cursor data.
+/// Expose only the operation and numeric codes, never native Debug/source chains.
+#[derive(thiserror::Error)]
 pub enum OracleAdapterError {
     /// A mounted credential file could not be read.
     #[error("failed to read Oracle {kind} file")]
@@ -943,8 +946,8 @@ pub enum OracleAdapterError {
     #[error("Oracle {0} file must not be empty")]
     EmptyCredential(&'static str),
     /// Oracle client initialization failed.
-    #[error("Oracle client initialization failed")]
-    Initialize(#[source] oracle::Error),
+    #[error("Oracle client initialization failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Initialize(oracle::Error),
     /// Oracle was already initialized outside this adapter.
     #[error("Oracle client was initialized before instant_client_dir was applied")]
     ClientAlreadyInitialized,
@@ -955,8 +958,8 @@ pub enum OracleAdapterError {
     #[error("Oracle client initialization lock was poisoned")]
     ClientInitializationLock,
     /// Connection establishment or validation failed.
-    #[error("Oracle connection failed")]
-    Connect(#[source] oracle::Error),
+    #[error("Oracle connection failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Connect(oracle::Error),
     /// The first slice cannot safely inject bounds into a connect descriptor.
     #[error("Oracle connect descriptors are not supported; use an Easy Connect string")]
     ConnectDescriptorUnsupported,
@@ -970,20 +973,20 @@ pub enum OracleAdapterError {
     #[error("Oracle connect string must contain exactly one database address")]
     MultipleAddressUnsupported,
     /// Session or timeout setup failed.
-    #[error("Oracle session configuration failed")]
-    Configure(#[source] oracle::Error),
+    #[error("Oracle session configuration failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Configure(oracle::Error),
     /// Statement preparation failed.
-    #[error("Oracle query preparation failed")]
-    Prepare(#[source] oracle::Error),
+    #[error("Oracle query preparation failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Prepare(oracle::Error),
     /// Query execution failed.
-    #[error("Oracle query execution failed")]
-    Query(#[source] oracle::Error),
+    #[error("Oracle query execution failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Query(oracle::Error),
     /// Row fetching failed.
-    #[error("Oracle row fetch failed")]
-    Fetch(#[source] oracle::Error),
+    #[error("Oracle row fetch failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Fetch(oracle::Error),
     /// Native value conversion failed.
-    #[error("Oracle value conversion failed")]
-    Convert(#[source] oracle::Error),
+    #[error("Oracle value conversion failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Convert(oracle::Error),
     /// A floating-point result cannot be represented faithfully.
     #[error("Oracle returned a non-finite floating-point value")]
     NonFiniteFloat,
@@ -1023,11 +1026,11 @@ pub enum OracleAdapterError {
     #[error("watermark cursor column '{0}' returned NULL; composite cursors must be non-null")]
     NullCursorValue(String),
     /// The committed cursor timestamp cannot be bound to Oracle.
-    #[error("committed watermark timestamp is not a valid Oracle timestamp: {0}")]
+    #[error("committed watermark timestamp is not a valid Oracle timestamp")]
     InvalidCursorTimestamp(String),
     /// The first row alone exceeds the normalized in-memory ceiling.
     #[error(
-        "the first database row normalizes to {normalized_bytes} bytes, exceeding the {limit}-byte query.max_normalized_bytes limit"
+        "the first database row normalizes to {normalized_bytes} bytes, exceeding the {limit}-byte budget from query.max_batch_bytes"
     )]
     NormalizedByteLimit {
         /// Normalized size of the single row.
@@ -1037,19 +1040,25 @@ pub enum OracleAdapterError {
     },
     /// Blocking Oracle execution could not be joined.
     #[error("Oracle worker failed")]
-    Worker(#[source] tokio::task::JoinError),
+    Worker(tokio::task::JoinError),
     /// Cancellation state could not be synchronized with the blocking worker.
     #[error("Oracle cancellation state is unavailable")]
     CancellationState,
     /// Native Oracle cancellation could not be joined.
     #[error("Oracle cancellation worker failed")]
-    CancellationWorker(#[source] tokio::task::JoinError),
+    CancellationWorker(tokio::task::JoinError),
     /// Oracle rejected a request to interrupt the active call.
-    #[error("Oracle cancellation failed")]
-    Cancellation(#[source] oracle::Error),
+    #[error("Oracle cancellation failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
+    Cancellation(oracle::Error),
     /// An operation was cancelled before it registered its connection.
     #[error("Oracle operation was cancelled")]
     Cancelled,
+}
+
+impl std::fmt::Debug for OracleAdapterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 #[cfg(test)]

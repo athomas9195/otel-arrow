@@ -35,9 +35,8 @@ groups:
                 interval: 5m
                 fetch_size: 1000
                 max_rows_per_poll: 10000
-                # Exact serialized OTLP ceiling for one emitted page.
+                # Applied separately to normalized row storage and encoded OTLP.
                 max_batch_bytes: 10 MiB
-                max_normalized_bytes: 5 MiB
                 timeout: 2m
               watermark:
                 mode: composite

@@ -220,8 +220,6 @@ struct OracleQueryConfig {
     max_rows_per_poll: usize,
     #[serde(deserialize_with = "deserialize_byte_size")]
     max_batch_bytes: u64,
-    #[serde(deserialize_with = "deserialize_byte_size")]
-    max_normalized_bytes: u64,
     #[serde(with = "humantime_serde")]
     timeout: Duration,
 }
@@ -235,7 +233,6 @@ impl OracleQueryConfig {
             fetch_size: self.fetch_size,
             max_rows_per_poll: self.max_rows_per_poll,
             max_batch_bytes: self.max_batch_bytes,
-            max_normalized_bytes: self.max_normalized_bytes,
         }
     }
 }

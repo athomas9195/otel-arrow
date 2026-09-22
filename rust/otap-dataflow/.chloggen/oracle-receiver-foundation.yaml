@@ -20,5 +20,5 @@ issues: [3918]
 # characters and subtext to 300 characters.
 subtext: |
   Requires commit-ordered immutable retained rows, NOT NULL cursor columns, a signed-range
-  tie-breaker, and the documented SELECT predicate. Set independent normalized and encoded
-  byte limits. Stop the pipeline before configuration changes; stuck workers require process restart.
+  tie-breaker, and the documented SELECT predicate. max_batch_bytes bounds normalized rows
+  and encoded payloads separately. Stop before configuration changes; stuck workers require process restart.

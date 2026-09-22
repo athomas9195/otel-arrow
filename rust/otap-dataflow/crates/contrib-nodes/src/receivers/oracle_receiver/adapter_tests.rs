@@ -12,6 +12,49 @@ use std::fs;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Scenario: A native Oracle failure contains sentinel SQL, row, endpoint and nested-source text.
+/// Guarantees: Adapter formatting and the complete engine diagnostic expose no native text.
+#[test]
+fn native_error_text_is_redacted_from_engine_diagnostics() {
+    use otel_arrow_dfe_engine::error::{Error, error_summary_from, format_error_sources};
+    use otel_arrow_dfe_scraper::database::DriverAdapter;
+    const SENTINEL: &str = "secret-row SELECT-private endpoint-private checkpoint-private";
+    let constructors: [fn(oracle::Error) -> OracleAdapterError; 8] = [
+        OracleAdapterError::Initialize,
+        OracleAdapterError::Connect,
+        OracleAdapterError::Configure,
+        OracleAdapterError::Prepare,
+        OracleAdapterError::Query,
+        OracleAdapterError::Fetch,
+        OracleAdapterError::Convert,
+        OracleAdapterError::Cancellation,
+    ];
+    for constructor in constructors {
+        let native = oracle::Error::with_source(
+            oracle::ErrorKind::InvalidOperation,
+            std::io::Error::other(SENTINEL),
+        );
+        let error = constructor(native);
+        let source_detail = format_error_sources(&error);
+        assert!(source_detail.is_empty());
+        assert!(!format!("{error:?}").contains(SENTINEL));
+        let engine = Error::ReceiverError {
+            receiver: otel_arrow_dfe_engine::testing::test_node("oracle-test"),
+            kind: super::OracleAdapter::classify_error(&error),
+            error: error.to_string(),
+            source_detail,
+        };
+        for rendered in [
+            engine.to_string(),
+            format!("{engine:?}"),
+            serde_json::to_string(&error_summary_from(&engine)).expect("diagnostic JSON"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(!rendered.contains("endpoint-private"), "{rendered}");
+        }
+    }
+}
+
 /// Scenario: An Oracle worker is idle after successfully completing an operation.
 /// Guarantees: Adapter shutdown closes its work channel and joins worker-side cleanup before returning.
 #[tokio::test]
