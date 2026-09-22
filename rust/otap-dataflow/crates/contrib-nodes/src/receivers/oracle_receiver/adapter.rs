@@ -3,6 +3,7 @@
 
 //! Oracle implementation of the database adapter contract.
 
+use super::worker::{NativeWorker, receive};
 use async_trait::async_trait;
 use oracle::sql_type::{IntervalDS, IntervalYM, OracleType, Timestamp};
 use oracle::{Connection, Row as OracleRow};
@@ -16,7 +17,7 @@ use std::io::Read;
 use std::mem::size_of;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // Oracle client initialization is process-global. The mutex only serializes
 // the one-time directory choice when multiple pipeline instances start.
@@ -35,20 +36,15 @@ pub(crate) struct OracleAdapterConfig {
 
 /// Oracle adapter that reuses one connection across non-overlapping polls.
 ///
-/// A long-lived `spawn_blocking` worker owns the session and prepared statement;
-/// cancellation temporarily shares a connection handle to interrupt active work.
-/// [`DriverAdapter::shutdown`] closes the work channel and awaits worker cleanup.
-/// Dropping the adapter without shutdown closes the channel but does not join
-/// the worker. Cleanup remains worker-owned; stuck native work can prevent it
-/// from completing.
+/// Dedicated OS workers own query/session work and native cancellation. Neither
+/// worker belongs to Tokio's blocking pool, so stuck native work cannot hold up
+/// that runtime's destruction. Shutdown confirms both workers' resource cleanup;
+/// the shared controller retains source ownership when its deadline expires.
 pub struct OracleAdapter {
     config: OracleAdapterConfig,
-    worker: Option<std::sync::mpsc::SyncSender<OracleWork>>,
-    worker_join: Option<tokio::task::JoinHandle<()>>,
+    worker: Option<NativeWorker<Option<OracleSession>>>,
     cancellation: OracleCancellation,
 }
-
-type OracleWork = Box<dyn FnOnce(&mut Option<OracleSession>) + Send>;
 
 /// One exclusively owned Oracle connection and the query artifacts prepared on it.
 struct OracleSession {
@@ -71,7 +67,6 @@ impl OracleAdapter {
         Self {
             config,
             worker: None,
-            worker_join: None,
             cancellation: OracleCancellation::default(),
         }
     }
@@ -92,19 +87,10 @@ impl OracleAdapter {
     where
         T: Send + 'static,
     {
-        // Run synchronous query jobs serially on a blocking worker with a
-        // capacity-one queue. Retain the session here between polls and drop
-        // it here once queued work finishes and the channel closes.
+        self.cancellation.ensure_not_requested()?;
         if self.worker.is_none() {
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<OracleWork>(1);
-            self.worker_join = Some(tokio::task::spawn_blocking(move || {
-                let mut session = None;
-                while let Ok(work) = receiver.recv() {
-                    work(&mut session);
-                }
-                drop(session);
-            }));
-            self.worker = Some(sender);
+            self.worker =
+                Some(NativeWorker::new("oracle-query").map_err(OracleAdapterError::Worker)?);
         }
         let worker = self.worker.as_ref().expect("worker initialized");
         // Clone inputs so queued work owns its data and can outlive this future.
@@ -112,18 +98,15 @@ impl OracleAdapter {
         let query = query.clone();
         let cursor = cursor.clone();
         let cancellation = self.cancellation.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        worker
-            .try_send(Box::new(move |session| {
-                let result = operation(session.take(), &config, &query, &cursor, &cancellation)
-                    .map(|(next, value)| {
-                        *session = Some(next);
-                        value
-                    });
-                _ = sender.send(result);
-            }))
-            .map_err(|_| OracleAdapterError::Cancelled)?;
-        receiver.await.map_err(|_| OracleAdapterError::Cancelled)?
+        let result = worker
+            .run(move |session| {
+                let (next, value) =
+                    operation(session.take(), &config, &query, &cursor, &cancellation)?;
+                *session = Some(next);
+                Ok(value)
+            })
+            .map_err(OracleAdapterError::Worker)?;
+        receive(result).await.map_err(OracleAdapterError::Worker)?
     }
 }
 
@@ -136,7 +119,10 @@ pub struct OracleCancellation {
 #[derive(Default)]
 struct CancellationState {
     requested: bool,
-    connection: Option<Arc<Connection>>,
+    stopped: bool,
+    // Only native workers may acquire/drop strong connection references.
+    connection: Option<Weak<Connection>>,
+    worker: Option<NativeWorker<()>>,
 }
 
 struct ActiveConnection {
@@ -147,16 +133,16 @@ impl ActiveConnection {
     /// Publishes the active connection so cancellation can interrupt only this operation.
     fn register(
         cancellation: &OracleCancellation,
-        connection: Arc<Connection>,
+        connection: &Arc<Connection>,
     ) -> Result<Self, OracleAdapterError> {
         let mut state = cancellation
             .state
             .lock()
             .map_err(|_| OracleAdapterError::CancellationState)?;
-        if state.requested {
+        if state.requested || state.stopped {
             return Err(OracleAdapterError::Cancelled);
         }
-        state.connection = Some(connection);
+        state.connection = Some(Arc::downgrade(connection));
         Ok(Self {
             cancellation: cancellation.clone(),
         })
@@ -173,17 +159,38 @@ impl Drop for ActiveConnection {
 }
 
 impl OracleCancellation {
+    /// Checks cancellation before and after one synchronous operation on a native worker.
+    fn native_call<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, OracleAdapterError>,
+    ) -> Result<T, OracleAdapterError> {
+        self.ensure_not_requested()?;
+        let value = operation()?;
+        self.ensure_not_requested()?;
+        Ok(value)
+    }
+
     /// Prevents a cancelled operation from opening a connection after cancellation won.
     fn ensure_not_requested(&self) -> Result<(), OracleAdapterError> {
         let state = self
             .state
             .lock()
             .map_err(|_| OracleAdapterError::CancellationState)?;
-        if state.requested {
+        if state.requested || state.stopped {
             Err(OracleAdapterError::Cancelled)
         } else {
             Ok(())
         }
+    }
+
+    fn take_worker(&self) -> Result<Option<NativeWorker<()>>, OracleAdapterError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OracleAdapterError::CancellationState)?;
+        state.requested = true;
+        state.stopped = true;
+        Ok(state.worker.take())
     }
 }
 
@@ -191,23 +198,45 @@ impl OracleCancellation {
 impl DriverCancellation for OracleCancellation {
     type Error = OracleAdapterError;
 
-    /// Interrupts the currently published Oracle call on the blocking pool.
+    /// Flags the whole operation and interrupts its native call on a dedicated worker.
     async fn cancel(&self) -> Result<(), Self::Error> {
-        let connection = {
+        let result = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| OracleAdapterError::CancellationState)?;
+            if state.stopped {
+                return Err(OracleAdapterError::Cancelled);
+            }
             state.requested = true;
-            state.connection.clone()
+            let Some(connection) = state.connection.clone() else {
+                return Ok(());
+            };
+            if state.worker.is_none() {
+                state.worker = Some(
+                    NativeWorker::new("oracle-cancel")
+                        .map_err(OracleAdapterError::CancellationWorker)?,
+                );
+            }
+            state
+                .worker
+                .as_ref()
+                .expect("cancellation worker initialized")
+                .run(move |_| {
+                    // Upgrade on this worker so even the last native reference
+                    // is dropped off-core when the query completes concurrently.
+                    match connection.upgrade() {
+                        Some(connection) => connection
+                            .break_execution()
+                            .map_err(OracleAdapterError::Cancellation),
+                        None => Ok(()),
+                    }
+                })
+                .map_err(OracleAdapterError::CancellationWorker)?
         };
-        let Some(connection) = connection else {
-            return Ok(());
-        };
-        tokio::task::spawn_blocking(move || connection.break_execution())
+        receive(result)
             .await
             .map_err(OracleAdapterError::CancellationWorker)?
-            .map_err(OracleAdapterError::Cancellation)
     }
 }
 
@@ -228,6 +257,9 @@ impl DriverAdapter for OracleAdapter {
             .state
             .lock()
             .map_err(|_| OracleAdapterError::CancellationState)?;
+        if state.stopped {
+            return Err(OracleAdapterError::Cancelled);
+        }
         state.requested = false;
         state.connection = None;
         drop(state);
@@ -239,8 +271,7 @@ impl DriverAdapter for OracleAdapter {
         &mut self,
         query: &CompiledQuery,
     ) -> Result<Vec<ColumnMetadata>, Self::Error> {
-        // rust-oracle is synchronous. Moving native calls to the blocking pool
-        // keeps the engine's local async control loop responsive.
+        // Native preparation and metadata inspection stay on the query worker.
         let initial = query.watermark().initial.clone();
         self.run_blocking(query, &initial, validate_blocking).await
     }
@@ -255,14 +286,26 @@ impl DriverAdapter for OracleAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), Self::Error> {
-        // Close the job channel and await worker exit, including session cleanup.
-        // This does not interrupt a running native call. The controller bounds
-        // this wait on normal/error loop exits and retains the lease if cleanup
-        // cannot be joined.
-        drop(self.worker.take());
-        if let Some(worker) = self.worker_join.take() {
-            worker.await.map_err(OracleAdapterError::Worker)?;
-        }
+        let query = self.worker.take();
+        let cancellation = self.cancellation.take_worker()?;
+        // Poll both stops so both channels close before either cleanup can wait.
+        // The caller owns the shared deadline and quarantines unconfirmed work.
+        let (query, cancellation) = tokio::join!(
+            async {
+                match query {
+                    Some(worker) => worker.stop().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match cancellation {
+                    Some(worker) => worker.stop().await,
+                    None => Ok(()),
+                }
+            },
+        );
+        query.map_err(OracleAdapterError::Worker)?;
+        cancellation.map_err(OracleAdapterError::CancellationWorker)?;
         Ok(())
     }
 
@@ -319,14 +362,14 @@ fn validate_blocking(
     // Executing the prepared SELECT is required because Oracle exposes result
     // metadata on the result set. No row is fetched during startup validation.
     let (mut session, _active) = prepare_session(session, config, query, cancellation)?;
-    ensure_prepared(&mut session, query, cursor)?;
+    ensure_prepared(&mut session, query, cursor, cancellation)?;
     let columns = session
         .prepared
         .as_ref()
         .expect("query was prepared")
         .columns
         .clone();
-    finish_session(&session.connection)?;
+    cancellation.native_call(|| finish_session(&session.connection))?;
     Ok((session, columns))
 }
 
@@ -339,9 +382,9 @@ fn execute_blocking(
     cancellation: &OracleCancellation,
 ) -> Result<(OracleSession, QueryPage), OracleAdapterError> {
     let (mut session, _active) = prepare_session(session, config, query, cancellation)?;
-    ensure_prepared(&mut session, query, cursor)?;
+    ensure_prepared(&mut session, query, cursor, cancellation)?;
     let prepared = session.prepared.as_mut().expect("query was prepared");
-    let mut result_set = bind_cursor(&mut prepared.statement, query, cursor)?;
+    let mut result_set = bind_cursor(&mut prepared.statement, query, cursor, cancellation)?;
     if !metadata_matches(result_set.column_info(), &prepared.columns, &prepared.types) {
         return Err(OracleAdapterError::ResultMetadataChanged);
     }
@@ -360,8 +403,9 @@ fn execute_blocking(
             prepared.timestamp_index,
             prepared.tie_breaker_index,
             watermark,
+            cancellation,
         )?;
-        let normalized = normalize_row(&row, &prepared.types)?;
+        let normalized = normalize_row(&row, &prepared.types, cancellation)?;
         let row_bytes = normalized
             .normalized_size()
             .saturating_add(cursor.timestamp.capacity() as u64);
@@ -389,7 +433,7 @@ fn execute_blocking(
         });
     }
     drop(result_set);
-    finish_session(&session.connection)?;
+    cancellation.native_call(|| finish_session(&session.connection))?;
 
     Ok((session, QueryPage { columns, rows }))
 }
@@ -402,7 +446,9 @@ fn bind_cursor<'a>(
     statement: &'a mut oracle::Statement,
     query: &CompiledQuery,
     cursor: &CompositeCursor,
+    cancellation: &OracleCancellation,
 ) -> Result<oracle::ResultSet<'a, OracleRow>, OracleAdapterError> {
+    cancellation.ensure_not_requested()?;
     let watermark = query.watermark();
     let timestamp = parse_cursor_timestamp(&cursor.timestamp)?;
     // Bind with timezone information even for DATE and timezone-naive
@@ -412,12 +458,14 @@ fn bind_cursor<'a>(
     let timestamp_type = cursor_bind_type();
     let timestamp_bind = (&timestamp, &timestamp_type);
     let tie_breaker = cursor.tie_breaker;
-    statement
+    let result = statement
         .query_named(&[
             (watermark.timestamp_bind.as_str(), &timestamp_bind),
             (watermark.tie_breaker_bind.as_str(), &tie_breaker),
         ])
-        .map_err(OracleAdapterError::Query)
+        .map_err(OracleAdapterError::Query)?;
+    cancellation.ensure_not_requested()?;
+    Ok(result)
 }
 
 /// Parses cursor text without overflow or lossy numeric narrowing in the driver.
@@ -451,7 +499,9 @@ fn ensure_prepared(
     session: &mut OracleSession,
     query: &CompiledQuery,
     cursor: &CompositeCursor,
+    cancellation: &OracleCancellation,
 ) -> Result<(), OracleAdapterError> {
+    cancellation.ensure_not_requested()?;
     if session.prepared.is_some() {
         return Ok(());
     }
@@ -465,13 +515,14 @@ fn ensure_prepared(
         .prefetch_rows(0)
         .build()
         .map_err(OracleAdapterError::Prepare)?;
-    let result_set = bind_cursor(&mut discovery, query, cursor)?;
+    let result_set = bind_cursor(&mut discovery, query, cursor, cancellation)?;
     let (columns, types) = result_metadata(result_set.column_info())?;
     let (timestamp_index, tie_breaker_index) =
         validate_cursor_columns(result_set.column_info(), query)?;
     drop(result_set);
     drop(discovery);
 
+    cancellation.ensure_not_requested()?;
     let fetch_rows = bounded_fetch_array_size(&types, query);
     let statement = session
         .connection
@@ -481,6 +532,7 @@ fn ensure_prepared(
         .prefetch_rows(0)
         .build()
         .map_err(OracleAdapterError::Prepare)?;
+    cancellation.ensure_not_requested()?;
     session.prepared = Some(OraclePreparedQuery {
         statement,
         columns,
@@ -600,15 +652,19 @@ fn extract_cursor(
     timestamp_index: usize,
     tie_breaker_index: usize,
     watermark: &otel_arrow_dfe_scraper::database::CompositeWatermark,
+    cancellation: &OracleCancellation,
 ) -> Result<CompositeCursor, OracleAdapterError> {
+    cancellation.ensure_not_requested()?;
     let timestamp = row
         .get::<_, Option<Timestamp>>(timestamp_index)
         .map_err(OracleAdapterError::Convert)?
         .ok_or_else(|| OracleAdapterError::NullCursorValue(watermark.timestamp_column.clone()))?;
+    cancellation.ensure_not_requested()?;
     let tie_breaker = row
         .get::<_, Option<i64>>(tie_breaker_index)
         .map_err(OracleAdapterError::Convert)?
         .ok_or_else(|| OracleAdapterError::NullCursorValue(watermark.tie_breaker_column.clone()))?;
+    cancellation.ensure_not_requested()?;
     // The text form round-trips through Timestamp::from_str on the next bind,
     // so the durable checkpoint keeps full source precision.
     Ok(CompositeCursor::new(timestamp.to_string(), tie_breaker))
@@ -621,22 +677,36 @@ fn prepare_session(
     query: &CompiledQuery,
     cancellation: &OracleCancellation,
 ) -> Result<(OracleSession, ActiveConnection), OracleAdapterError> {
+    cancellation.ensure_not_requested()?;
+    let new_connection = session.is_none();
     let session = match session {
         Some(session) => session,
-        None => {
-            cancellation.ensure_not_requested()?;
-            OracleSession {
-                connection: Arc::new(connect(config, query.timeout())?),
-                prepared: None,
-            }
-        }
+        None => OracleSession {
+            connection: Arc::new(connect(config, query.timeout(), cancellation)?),
+            prepared: None,
+        },
     };
-    let active = ActiveConnection::register(cancellation, Arc::clone(&session.connection))?;
+    let active = ActiveConnection::register(cancellation, &session.connection)?;
+    cancellation.ensure_not_requested()?;
     session
         .connection
         .set_call_timeout(Some(query.timeout()))
         .map_err(OracleAdapterError::Configure)?;
+    cancellation.ensure_not_requested()?;
+    if new_connection {
+        session
+            .connection
+            .ping()
+            .map_err(OracleAdapterError::Connect)?;
+        cancellation.ensure_not_requested()?;
+        _ = session
+            .connection
+            .execute("ALTER SESSION SET TIME_ZONE = 'UTC'", &[])
+            .map_err(OracleAdapterError::Configure)?;
+        cancellation.ensure_not_requested()?;
+    }
     begin_read_only(&session.connection)?;
+    cancellation.ensure_not_requested()?;
     Ok((session, active))
 }
 
@@ -682,31 +752,28 @@ fn column_metadata(column: &oracle::ColumnInfo) -> ColumnMetadata {
     }
 }
 
-/// Initializes the client, reads mounted credentials, and establishes a UTC Oracle session.
+/// Initializes the client, reads mounted credentials, and opens a connection.
 fn connect(
     config: &OracleAdapterConfig,
     timeout: std::time::Duration,
+    cancellation: &OracleCancellation,
 ) -> Result<Connection, OracleAdapterError> {
-    initialize_client(&config.instant_client_dir)?;
+    cancellation.native_call(|| initialize_client(&config.instant_client_dir))?;
     // Mounted files are read for each new connection so secret rotation takes
     // effect after a reconnect without placing credentials in configuration.
-    let username = read_credential(&config.username_file, "username")?;
-    let password = read_credential(&config.password_file, "password")?;
+    let username =
+        cancellation.native_call(|| read_credential(&config.username_file, "username"))?;
+    let password =
+        cancellation.native_call(|| read_credential(&config.password_file, "password"))?;
     let connect_string = bounded_connect_string(&config.connect_string, timeout)?;
-    let connection = Connection::connect(
-        username.expose_secret(),
-        password.expose_secret(),
-        connect_string,
-    )
-    .map_err(OracleAdapterError::Connect)?;
-    connection
-        .set_call_timeout(Some(timeout))
-        .map_err(OracleAdapterError::Configure)?;
-    connection.ping().map_err(OracleAdapterError::Connect)?;
-    _ = connection
-        .execute("ALTER SESSION SET TIME_ZONE = 'UTC'", &[])
-        .map_err(OracleAdapterError::Configure)?;
-    Ok(connection)
+    cancellation.native_call(|| {
+        Connection::connect(
+            username.expose_secret(),
+            password.expose_secret(),
+            connect_string,
+        )
+        .map_err(OracleAdapterError::Connect)
+    })
 }
 
 /// Makes the database enforce the receiver's read-only query contract.
@@ -854,11 +921,17 @@ fn validate_types(types: &[OracleType]) -> Result<(), OracleAdapterError> {
 }
 
 /// Applies the cached type plan to every cell in one Oracle row.
-fn normalize_row(row: &OracleRow, types: &[OracleType]) -> Result<Row, OracleAdapterError> {
+fn normalize_row(
+    row: &OracleRow,
+    types: &[OracleType],
+    cancellation: &OracleCancellation,
+) -> Result<Row, OracleAdapterError> {
     let values = types
         .iter()
         .enumerate()
-        .map(|(index, source_type)| normalize_cell(row, index, source_type))
+        .map(|(index, source_type)| {
+            cancellation.native_call(|| normalize_cell(row, index, source_type))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Row { values })
 }
@@ -1071,15 +1144,15 @@ pub enum OracleAdapterError {
         /// Configured normalized-byte ceiling.
         limit: u64,
     },
-    /// Blocking Oracle execution could not be joined.
+    /// The Oracle query worker could not start, accept work, or confirm completion.
     #[error("Oracle worker failed")]
-    Worker(tokio::task::JoinError),
+    Worker(#[source] std::io::Error),
     /// Cancellation state could not be synchronized with the blocking worker.
     #[error("Oracle cancellation state is unavailable")]
     CancellationState,
-    /// Native Oracle cancellation could not be joined.
+    /// The native cancellation worker could not start, accept work, or confirm completion.
     #[error("Oracle cancellation worker failed")]
-    CancellationWorker(tokio::task::JoinError),
+    CancellationWorker(#[source] std::io::Error),
     /// Oracle rejected a request to interrupt the active call.
     #[error("Oracle cancellation failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
     Cancellation(oracle::Error),

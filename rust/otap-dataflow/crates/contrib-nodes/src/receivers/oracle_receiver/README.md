@@ -44,9 +44,8 @@ exactly once and does not implement every capability proposed in the
 4. Adapt the [complete pipeline example](#full-configuration), then use the
    [Windows or Linux commands](#running) to start it on one core.
 
-All fields shown in the configuration tables are required. Unlike receivers
-with default connection or polling settings, this receiver requires explicit
-operational bounds. Unknown fields are rejected.
+Fields marked **required** must be provided. Only the optional catch-up budgets
+have defaults. Unknown fields are rejected.
 
 ## Configuration
 
@@ -69,8 +68,8 @@ Do not copy proposed or older schema variants into the native configuration:
   and `initial` values, and `mode: composite`; flat `timestamp_column`,
   `tie_breaker_column`, and `start_at` fields are not accepted.
 - Scalar and snapshot configurations are proposals, not implemented modes.
-- A deployment system may choose defaults, but the native schema requires every
-  field listed below, including `max_batch_bytes` and `nack_backoff`.
+- A deployment system may choose defaults, but the native schema requires all
+  fields marked required, including `max_batch_bytes` and `nack_backoff`.
 
 ### Top-Level Fields
 
@@ -130,11 +129,17 @@ your Oracle client and connection security separately for the deployment.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `query.statement` | string | **required** | One SELECT in the [supported query shape](#required-query-shape), at most 16 KiB after trimming the optional trailing semicolon and surrounding whitespace. |
-| `query.interval` | duration string | **required** | Between `1ms` and `24h`, inclusive. Interval before the next eligible poll; unresolved feedback prevents another page. |
+| `query.interval` | duration string | **required** | Between `1ms` and `24h`, inclusive. Delay after a poll cycle ends; acknowledged catch-up pages do not wait this interval. |
 | `query.fetch_size` | integer | **required** | Between `1` and `10000`, and no greater than `max_rows_per_poll`. Target native fetch size, further capped by row and byte budgets. |
-| `query.max_rows_per_poll` | integer | **required** | Between `1` and `10000`. Maximum rows fetched for one poll. |
+| `query.max_rows_per_poll` | integer | **required** | Between `1` and `10000`. Maximum rows fetched per page, including catch-up pages. |
 | `query.max_batch_bytes` | byte count or size string | **required** | Between 1 byte and 256 MiB, inclusive. For example, `10485760` or `10 MiB`. Applied separately to normalized row storage and encoded OTLP. |
 | `query.timeout` | duration string | **required** | Between `1ms` and `5m`, inclusive. Native Oracle call timeout, not a whole-poll or downstream-ACK deadline. |
+| `query.catch_up.max_pages` | integer | `32` | Between `1` and `1024`. Maximum page fetches per cycle, including empty probes. Set to `1` for single-page cycles. |
+| `query.catch_up.max_duration` | duration string | `10s` | Between `1ms` and `5m`. Elapsed cycle budget for admitting another fetch, not an in-flight query deadline. |
+
+Catch-up remains ACK-gated with one pending page. It stops on an empty page,
+budget exhaustion, downstream admission pressure, or a stop request. The receiver
+also observes the pipeline's process-memory admission state.
 
 There is no independent `query.max_normalized_bytes` setting. For example,
 `max_batch_bytes: 10 MiB` caps each of the normalized-row and encoded-payload
@@ -615,16 +620,19 @@ must not be added to logs; `source_id` must be safe to emit.
   distributed source discovery are not implemented.
 - Composite watermark and `on_nack: rewind` only. No snapshots, scalar cursor,
   CDC, delete capture, multiple named queries, or configurable output mapping.
-- No whole-poll deadline, normal-operation ACK deadline, process-RSS ceiling,
-  or immediate backlog catch-up mode.
+- No whole-poll deadline, normal-operation ACK deadline, or process-RSS ceiling.
 - No generic retry policy for query/conversion failures or NACK retry limit.
   Checkpoint retries have their own explicit failure limit.
-- Database calls, encoding, and checkpoint I/O run off the pipeline core. Native
-  call cancellation and cleanup still depend on Oracle and OS behavior.
+- Query/session work and native cancellation use separate bounded OS workers,
+  each with one queue slot; the cancellation worker starts only when needed.
+  Neither belongs to Tokio's blocking pool. Cancellation is checked between
+  native calls, fetches, and column conversions.
 - Stop/cancellation waits are bounded by the earlier active deadline and a
   five-second worker-stop cap. If cleanup cannot be joined, ownership is held
-  until process exit. A stuck native worker can prevent runtime teardown;
-  configure the service supervisor with a hard process-stop timeout.
+  until process exit. Shutdown confirms both workers' cleanup before releasing
+  ownership. Stuck native work may outlive the runtime, but does not make Tokio
+  join these workers. It still requires process-level recovery; configure the
+  service supervisor with a hard process-stop timeout.
 - Do not delete lock/generation files or start a replacement while abandoned
   work may still be running. Stop-before-start is required for configuration
   changes; see [Live configuration changes](#live-configuration-changes).

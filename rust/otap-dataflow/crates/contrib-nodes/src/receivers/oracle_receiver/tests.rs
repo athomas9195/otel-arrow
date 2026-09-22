@@ -98,6 +98,34 @@ fn uses_one_byte_limit_for_rows_and_encoding() {
     );
 }
 
+/// Scenario: Oracle configuration omits or overrides the shared catch-up budgets.
+/// Guarantees: Shared defaults are preserved and explicit native settings reach the query plan.
+#[test]
+fn forwards_catch_up_configuration() {
+    let defaults = parsed(documented_config())
+        .expect("defaults")
+        .query()
+        .catch_up();
+    assert_eq!(defaults.max_pages, 32);
+    assert_eq!(defaults.max_duration, Duration::from_secs(10));
+    let mut config = documented_config();
+    config["query"]["catch_up"] = serde_json::json!({"max_pages": 1, "max_duration": "2s"});
+    let configured = parsed(config).expect("override").query().catch_up();
+    assert_eq!(configured.max_pages, 1);
+    assert_eq!(configured.max_duration, Duration::from_secs(2));
+}
+
+/// Scenario: Oracle configuration supplies an invalid shared catch-up page budget.
+/// Guarantees: The vendor wrapper applies shared validation instead of bypassing it.
+#[test]
+fn rejects_invalid_catch_up_budget() {
+    for pages in [0, 1025] {
+        let mut config = documented_config();
+        config["query"]["catch_up"] = serde_json::json!({"max_pages": pages});
+        assert!(parsed(config).is_err());
+    }
+}
+
 /// Scenario: Configuration includes the removed independent normalized-row byte setting.
 /// Guarantees: The obsolete field is rejected rather than silently ignored.
 #[test]

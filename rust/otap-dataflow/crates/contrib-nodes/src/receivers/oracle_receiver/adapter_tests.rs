@@ -56,46 +56,102 @@ fn native_error_text_is_redacted_from_engine_diagnostics() {
     }
 }
 
-/// Scenario: An Oracle worker is idle after successfully completing an operation.
-/// Guarantees: Adapter shutdown closes its work channel and joins worker-side cleanup before returning.
-#[tokio::test]
-async fn shutdown_joins_worker_after_successful_operation() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let cleaned = Arc::new(AtomicBool::new(false));
-    let worker_cleaned = Arc::clone(&cleaned);
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<super::OracleWork>(1);
-    let (finished, completion) = tokio::sync::oneshot::channel();
-    let mut adapter = super::OracleAdapter::new(super::OracleAdapterConfig {
+fn test_adapter() -> super::OracleAdapter {
+    super::OracleAdapter::new(super::OracleAdapterConfig {
         connect_string: String::new(),
         instant_client_dir: String::new(),
         username_file: String::new(),
         password_file: String::new(),
-    });
-    adapter.worker = Some(sender);
-    adapter.worker_join = Some(tokio::task::spawn_blocking(move || {
-        let mut session = None;
-        while let Ok(work) = receiver.recv() {
-            work(&mut session);
-        }
-        worker_cleaned.store(true, Ordering::SeqCst);
-    }));
-    assert!(
-        adapter
-            .worker
-            .as_ref()
-            .expect("worker")
-            .try_send(Box::new(move |_| {
-                _ = finished.send(());
-            }))
-            .is_ok()
-    );
-    completion.await.expect("successful operation");
-    assert!(!cleaned.load(Ordering::SeqCst));
+    })
+}
+
+/// Scenario: An Oracle worker is idle after successfully completing an operation.
+/// Guarantees: Adapter shutdown closes its work channel and confirms worker cleanup before returning.
+#[tokio::test]
+async fn shutdown_joins_worker_after_successful_operation() {
+    let mut adapter = test_adapter();
+    adapter.worker = Some(super::NativeWorker::new("oracle-adapter-test").expect("worker"));
+    let operation = adapter
+        .worker
+        .as_ref()
+        .expect("worker")
+        .run(|_| std::thread::current().id())
+        .expect("accepted operation");
+    let worker_thread = super::receive(operation)
+        .await
+        .expect("successful operation");
+    assert_ne!(worker_thread, std::thread::current().id());
     otel_arrow_dfe_scraper::database::DriverAdapter::shutdown(&mut adapter)
         .await
         .expect("shutdown");
-    assert!(cleaned.load(Ordering::SeqCst));
+    assert!(adapter.worker.is_none());
+    assert!(adapter.cancellation.state.lock().expect("state").stopped);
+}
+
+/// Scenario: Native cancellation is still running after the query worker becomes idle.
+/// Guarantees: Adapter shutdown does not confirm cleanup before the cancellation worker finishes.
+#[tokio::test]
+async fn shutdown_waits_for_cancellation_worker() {
+    let mut adapter = test_adapter();
+    adapter.worker = Some(super::NativeWorker::new("oracle-query-test").expect("worker"));
+    let cancellation = super::NativeWorker::new("oracle-cancel-test").expect("worker");
+    let (release, gate) = std::sync::mpsc::sync_channel(1);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let _operation = cancellation
+        .run(move |_| {
+            let _ = started.send(());
+            gate.recv().expect("released");
+        })
+        .expect("cancel job");
+    adapter.cancellation.state.lock().expect("state").worker = Some(cancellation);
+    super::receive(ready).await.expect("cancellation started");
+    let shutdown = otel_arrow_dfe_scraper::database::DriverAdapter::shutdown(&mut adapter);
+    tokio::pin!(shutdown);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+            .await
+            .is_err()
+    );
+    release.send(()).expect("release cancellation");
+    tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .expect("cleanup completes")
+        .expect("shutdown");
+}
+
+/// Scenario: Cancellation arrives before any connection exists, then shutdown closes the adapter.
+/// Guarantees: The operation is cancelled without spawning native work and cannot restart after shutdown.
+#[tokio::test]
+async fn cancellation_before_connect_stops_admission() {
+    use otel_arrow_dfe_scraper::database::{DriverAdapter, DriverCancellation};
+    let mut adapter = test_adapter();
+    let cancellation = adapter.begin_operation().expect("operation");
+    cancellation.cancel().await.expect("no active connection");
+    assert!(matches!(
+        cancellation.ensure_not_requested(),
+        Err(OracleAdapterError::Cancelled)
+    ));
+    adapter.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        adapter.begin_operation(),
+        Err(OracleAdapterError::Cancelled)
+    ));
+}
+
+/// Scenario: Cancellation is requested during a native call that otherwise succeeds.
+/// Guarantees: Its result is rejected and no subsequent call begins for that operation.
+#[test]
+fn cancellation_is_checked_between_native_calls() {
+    let cancellation = super::OracleCancellation::default();
+    let result = cancellation.native_call(|| {
+        cancellation.state.lock().expect("state").requested = true;
+        Ok(())
+    });
+    assert!(matches!(result, Err(OracleAdapterError::Cancelled)));
+    assert!(matches!(
+        cancellation.native_call::<()>(|| panic!("cancelled operation must not run")),
+        Err(OracleAdapterError::Cancelled)
+    ));
 }
 
 fn watermark() -> CompositeWatermark {

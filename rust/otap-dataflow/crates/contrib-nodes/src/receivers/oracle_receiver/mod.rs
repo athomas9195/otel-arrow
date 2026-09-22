@@ -10,6 +10,7 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 
 mod adapter;
 mod config;
+mod worker;
 
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::error::Error as ConfigError;
@@ -17,6 +18,7 @@ use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::ReceiverFactory;
 use otel_arrow_dfe_engine::config::ReceiverConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_engine::memory_limiter::LocalReceiverAdmissionState;
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
@@ -68,6 +70,7 @@ fn build(
         checkpoint.nack_backoff,
         checkpoint.max_consecutive_failures,
         config.source_id().to_owned(),
+        LocalReceiverAdmissionState::from_process_state(&pipeline.memory_pressure_state()),
         metrics,
     ))
 }

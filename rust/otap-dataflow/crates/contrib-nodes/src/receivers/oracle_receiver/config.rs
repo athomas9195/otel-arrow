@@ -12,7 +12,7 @@
 
 use super::adapter::{OracleAdapter, OracleAdapterConfig, parse_cursor_timestamp};
 use otel_arrow_dfe_scraper::database::{
-    CheckpointConfig, CompiledQuery, OutputConfig, PollingConfig, WatermarkConfig,
+    CatchUpConfig, CheckpointConfig, CompiledQuery, OutputConfig, PollingConfig, WatermarkConfig,
 };
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -233,6 +233,8 @@ struct OracleQueryConfig {
     max_batch_bytes: u64,
     #[serde(with = "humantime_serde")]
     timeout: Duration,
+    #[serde(default)]
+    catch_up: CatchUpConfig,
 }
 
 impl OracleQueryConfig {
@@ -244,6 +246,7 @@ impl OracleQueryConfig {
             fetch_size: self.fetch_size,
             max_rows_per_poll: self.max_rows_per_poll,
             max_batch_bytes: self.max_batch_bytes,
+            catch_up: self.catch_up,
         }
     }
 }
