@@ -29,7 +29,9 @@ Each node page follows the same general shape:
 
 Contrib nodes are enabled through Cargo features or aggregate features such as
 `contrib-nodes`, `contrib-receivers`, `contrib-processors`, and
-`contrib-exporters`. A node documented as `Experimental`, `Alpha`, or `WIP`
+`contrib-exporters`. The Oracle receiver is an exception: enable it with
+`--features oracle-receiver` so the native `oracle` crate is not pulled in
+unless requested. A node documented as `Experimental`, `Alpha`, or `WIP`
 has no stable compatibility guarantee yet, and its behavior or configuration
 can change between releases.
 
@@ -58,6 +60,7 @@ Receivers ingest data into a pipeline.
 | --- | --- | --- | --- |
 | `receiver:etw` | `etw` | Experimental | Ingests Event Tracing for Windows events as logs. |
 | [`receiver:kafka`](src/receivers/kafka_receiver/README.md) | `kafka` | Experimental | Consumes traces, metrics, and logs from Kafka. |
+| [`urn:otel:receiver:oracle`](src/receivers/oracle_receiver/README.md) | `oracle-receiver` | Experimental | Polls Oracle with a read-only query. Opt-in; not in `contrib-receivers`. |
 | [`receiver:user_events`](src/receivers/user_events_receiver/README.md) | `user-events` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
 
 ## Processors
