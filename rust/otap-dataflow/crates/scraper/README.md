@@ -108,11 +108,13 @@ The minimal shared polling block is:
 interval: 5m
 timeout: 2m
 max_rows_per_poll: 10000
-fetch_size: 1000
+fetch_size_rows: 1000
 max_batch_bytes: 10485760
 ```
 
-All five fields are required by the shared deserialization type. The byte limit
+All five fields above are required by the shared deserialization type. Omitting
+`catch_up` uses bounded multi-page cycles: up to 32 page fetches or 10 seconds
+of elapsed admission time. The byte limit
 is a numeric byte count in these common types; a vendor schema may provide
 different defaults or convenience units.
 
@@ -145,11 +147,45 @@ use `CompiledQuery::compile`, which validates all four configuration inputs.
 
 | Field | Type | Default | Validation / meaning |
 | --- | --- | --- | --- |
-| `interval` | duration string | **required** | Between `1ms` and `24h`, inclusive. Configured interval between eligible polls; unresolved downstream feedback blocks the next page. |
+| `interval` | duration string | **required** | Between `1ms` and `24h`, inclusive. Delay after a cycle ends, not between its pages; unresolved downstream feedback blocks the next page. |
 | `timeout` | duration string | **required** | Must be greater than zero. The contract exposes a native-call timeout, not a guaranteed whole-poll deadline. |
 | `max_rows_per_poll` | integer | **required** | Between `1` and `10000`. Hard row ceiling the adapter must enforce while building its returned page. |
-| `fetch_size` | integer | **required** | Between `1` and `10000`, and no larger than `max_rows_per_poll`. Target native fetch size. |
+| `fetch_size_rows` | integer rows | **required** | Between `1` and `10000`, and no larger than `max_rows_per_poll`. Target rows per native fetch, not bytes. |
 | `max_batch_bytes` | integer bytes | **required** | Between `1` and `268435456` (256 MiB). Applied separately to accounted normalized-row storage and the exact serialized OTLP payload; not a combined memory ceiling. |
+| `catch_up` | object | Default budgets below | Optional budget overrides for normal bounded paging. Omitted fields use defaults; null and unknown fields are rejected. |
+| `catch_up.max_pages` | integer | `32` | Between `1` and `1024`, inclusive. Maximum page fetches per cycle, including empty probes. Set to `1` for single-page cycles. |
+| `catch_up.max_duration` | duration string | `10s` | Between `1ms` and `5min`, inclusive. Elapsed cycle budget for admitting the next fetch; not a whole-poll hard deadline. |
+
+For example, this explicitly supplies the default cycle budgets without
+introducing another receiver URN or changing the per-page limits:
+
+```yaml
+# A shared polling block, not a complete receiver configuration.
+interval: 5m
+timeout: 2m
+max_rows_per_poll: 10000
+fetch_size_rows: 1000
+max_batch_bytes: 10485760
+catch_up:
+  max_pages: 32
+  max_duration: 10s
+```
+
+The 32-page and 10-second defaults are implementation choices, not values
+prescribed by the RFC or universal production sizing recommendations. Tune them
+for database capacity and downstream latency. A partial override such as
+`catch_up: { max_pages: 1 }` keeps the default duration but fetches at most one
+page per cycle; it does not restore an interval timer measured from page send.
+`max_rows_per_poll` and `max_batch_bytes` continue to bound each fetched/emitted
+page, not the whole cycle. The cycle's maximum row work is
+`catch_up.max_pages * max_rows_per_poll`; its aggregate normalized-row and
+serialized-payload budgets are each at most
+`catch_up.max_pages * max_batch_bytes`, separately. These are work bounds, not
+an RSS ceiling or a promise to retain all those pages concurrently.
+
+Earlier pre-release configurations must rename `fetch_size` to
+`fetch_size_rows`; the old name is not accepted as an alias. The row-count
+meaning and bounds are unchanged.
 
 ### Watermark Configuration
 
@@ -316,8 +352,71 @@ capacities, not the entire process working set. OTLP records, serialized output,
 metadata, and native fetch buffers may coexist. The adapter's normalized-row
 budget and the encoder's serialized-payload budget both use `max_batch_bytes`;
 there is no additional receiver setting. Each representation is checked
-separately, so their combined footprint can exceed this value. This does not
-provide process-wide memory-pressure admission or an RSS ceiling.
+separately, so their combined footprint can exceed this value. Byte accounting
+does not provide an RSS ceiling. Separately, the controller gates new fetches
+on the engine's local memory-pressure admission state, as described below;
+it does not implement full global `MemoryAdmission` accounting.
+
+The polling controller keeps one OTLP encoder per receiver. It caches validated
+column metadata, the event-time column index, and constant resource/scope
+metadata and wire sizes. Each page's full metadata is compared with the cached
+schema; changed names, order, types, or nullability trigger revalidation before
+encoding, including for empty result sets. The cache stores only the current schema, not query results or a
+history of schemas.
+
+The encoder moves owned cell strings and bytes into protobuf values, then hands
+the serialized OTLP buffer to downstream ownership. It clears all row payloads
+after every call, including failures, and reuses only the empty record vector
+up to a 4 MiB capacity bound. This retention bound is not a page or process
+memory limit. Protobuf still requires owned per-record keys and metadata; this
+is not zero-copy encoding. The exact serialized-byte ceiling and the cursor of
+the last emitted row are unchanged.
+
+An optional cache-reuse microbenchmark compares a warmed encoder with the
+optimized one-shot API. Run it in isolation from the other tests:
+
+```powershell
+cargo test -p otel-arrow-dfe-scraper compare_warmed_encoder_with_optimized_one_shot -- --ignored --nocapture --test-threads=1
+```
+
+It checks equivalent output and reports timings without a speed assertion.
+Debug-build timings are not production throughput or a comparison with an
+earlier revision.
+
+For large-page memory qualification, run the ignored profile alone in a fresh
+test process:
+
+```powershell
+cargo test -p otel-arrow-dfe-scraper profile_large_owned_page_memory -- --ignored --nocapture --test-threads=1
+```
+
+It constructs 10,000 owned rows with a 24 KiB string each, under a 256 MiB
+`max_batch_bytes` limit, and reports normalized-row and serialized-payload sizes.
+The phase markers allow an external process-memory sampler to capture the
+baseline, completed input, and retained output. Measure the test process, not
+Cargo or a concurrently running test suite.
+
+Peak resident memory is a measured property, not the sum of the reported
+logical byte counters: row storage, protobuf metadata, the output buffer,
+allocator overhead, and the runtime can coexist. This synthetic profile does
+not include an Oracle client, native fetch/prefetch buffers, transport
+compression, gRPC/TLS buffers, or other pipeline nodes. Deployment sizing must
+include those separately; the profile is not a container-memory guarantee.
+
+One encoder-only Windows x64 debug measurement (Rust 1.98.1, three fresh
+processes, OS peak working set sampled every 10 ms) produced:
+
+| Quantity | Result |
+| --- | --- |
+| Rows and string size | 10,000 rows, 24 KiB per row |
+| Accounted normalized-row storage | 234.91 MiB |
+| Serialized OTLP payload | 236.07 MiB |
+| Peak process working set | 482.43-482.44 MiB |
+
+Both logical representations fit the 256 MiB setting, while peak resident
+memory was much larger. The measured peak includes the test process and
+encoding allocations, not native database or downstream buffers. It is a
+workload-specific sizing example, not a portable peak-memory bound.
 
 `CellValue` and `CompositeCursor` debug output redact their values; nested
 cursor rows/pages therefore do not reveal the cursor through their debug
@@ -325,6 +424,10 @@ representation. `CompiledQuery` also redacts SQL and its initial cursor.
 Timestamp and tie-breaker configuration debug output redacts `initial`,
 including when nested inside `WatermarkConfig`; the actual configured values
 remain available for query binding.
+`EncodedPage` also redacts its serialized payload and cursor in direct, pretty,
+and nested `Debug` output; only counts and sizes remain visible. The payload
+itself still contains the original customer data for delivery. Formatting
+extracted raw payloads directly bypasses this wrapper's protection.
 This is not blanket redaction of every configuration type or error: callers
 must not log raw watermark configuration, native driver errors, endpoints,
 or other sensitive inputs.
@@ -358,6 +461,49 @@ Acquire source ownership and load committed position
 The initial runtime keeps one page pending per source. Multiple
 in-flight batches would additionally require a contiguous acknowledgement
 frontier; a later ACK must never skip an earlier unresolved batch.
+
+### Bounded Catch-Up and Admission
+
+Bounded catch-up is the normal polling behavior. A successful page may be followed
+immediately by the next page only after its matching ACK and durable checkpoint commit. Each fetch
+still uses the existing per-page row and byte bounds. The elapsed cycle budget
+includes fetch, encoding, downstream ACK, and checkpoint waits. It only gates
+admission of the next fetch: already-admitted work may finish, receive its ACK,
+and commit after the budget expires. It is not a whole-poll hard deadline or a
+normal-operation ACK timeout.
+
+An empty query result ends the cycle. A short nonempty page is not proof of
+end-of-data: normalized or serialized byte limits can truncate it before the
+row limit. Another fetch, including an extra empty probe, is allowed while
+both budgets permit it. When a cycle ends, the normal `interval` starts then.
+There is no separate opt-in or legacy scheduling mode; unresolved feedback still
+blocks another fetch.
+
+A NACK ends the burst and uses the existing `nack_backoff` without advancing
+the committed cursor. Native query errors still fail the receiver rather
+than gaining a new retry policy. A checkpoint write failure ends immediate
+catch-up, but the existing checkpoint retry policy must first finish committing
+the ACKed page (or reach its terminal failure limit).
+
+Downstream backpressure and Hard memory pressure in Enforce mode end the burst
+and pause new-fetch admission. Already-admitted work may still finish, ACK, and
+commit; pressure is not a request to discard acknowledged progress. Observe-only
+memory pressure does not block admission. Control messages remain handled
+during fetch, encoding, send, feedback, and checkpoint phases.
+
+Receiver factories must bootstrap admission from the process state, not assume
+startup is unpressured:
+
+```rust,ignore
+let admission =
+    LocalReceiverAdmissionState::from_process_state(&pipeline_ctx.memory_pressure_state());
+// Supply admission immediately before metrics in DatabaseReceiver::new(...).
+```
+
+`DatabaseReceiver::new` requires this `LocalReceiverAdmissionState` argument
+before its metrics argument. This honors an initial Hard state and the configured
+Enforce versus observe-only mode. Vendor factory wiring is a downstream
+integration responsibility; this library does not register a new receiver.
 
 ### Filesystem Guarantees
 
@@ -437,12 +583,38 @@ it is not a database-source ownership key.
 
 ### Shutdown and Live Configuration Changes
 
-The polling controller offloads encoding and checkpoint I/O while handling control
-messages. Checkpoint retries honor an already-active drain deadline. Worker-stop
-waits respect the earlier supplied deadline and the five-second stop cap.
-Unconfirmed cleanup retains ownership until process exit rather than allowing
-overlapping source work; uninterruptible native work can require a supervisor
-to terminate the process.
+Each receiver owns one dedicated thread for encoding and checkpoint I/O, with
+a capacity-one request queue and nonblocking submission. This keeps large-page
+encoding and filesystem calls off the pipeline's async thread without creating
+per-page threads or using Tokio's runtime-owned blocking pool.
+
+The controller continues processing control messages while work runs.
+Checkpoint retries inherit an already-active drain deadline rather than waiting
+for a new stop message. Active-operation cancellation and checkpoint stop waits
+use the earlier supplied deadline and a five-second cap. Final adapter and
+scraper-worker cleanup are attempted concurrently within the remaining stop
+budget; ordinary error exits receive a five-second cleanup budget. A drain may
+still wait for downstream feedback until its supplied deadline; this is not a
+universal five-second bound on the entire drain.
+
+Worker completion requires an explicit exit acknowledgement, not merely a
+dropped result handle. If both adapter and scraper cleanup subsequently succeed,
+an earlier abandonment flag is cleared: the original error is preserved and the
+lease can be reacquired without a process restart.
+If native work or a scraper job cannot be confirmed
+stopped, the receiver reports an error and retains its source lease until
+process exit. The dedicated scraper thread does not make Tokio runtime
+destruction wait for a stalled filesystem/encoding job. The thread is not
+forcibly killed: a supervisor must terminate/restart the process to clear an
+unconfirmed worker and its quarantined ownership. Starting a replacement
+receiver in the same process must not bypass that quarantine.
+
+Adapter cancellation must stop the whole operation. In particular, native fetch
+and conversion loops must check cancellation between calls rather than assume
+interrupting one call stops later calls. Potentially uninterruptible native
+operations, including the cancellation operation itself, must use adapter-owned
+workers rather than the pipeline runtime's blocking pool. Timing out a future
+does not cancel a running native call.
 
 Stop the existing pipeline before starting it with changed configuration,
 including interval-only changes. A replacement started first can conflict with
@@ -465,7 +637,7 @@ leases do not emit these runtime metrics by themselves.
 | `event_time_fallbacks` | Records whose event time cannot fit the OTLP timestamp range. |
 | `acks`, `nacks`, `replays`, `stale_feedback` | Matched downstream outcomes, replay, and rejected stale feedback. |
 | `checkpoint_commits`, `checkpoint_failures`, `checkpoint_cleanup_failures` | Durable progress and persistence/cleanup failures. |
-| `cancellations`, `drains`, `shutdowns` | Receiver lifecycle operations. |
+| `cancellations`, `drains`, `shutdowns` | Cancellation attempts and received drain/shutdown requests, including during checkpoint writes and retries; not counts of successful cleanup. |
 
 Measurement attributes are intentionally omitted to keep cardinality bounded.
 The RFC's duration histograms, lag gauges, and broader health signals are not
@@ -478,9 +650,9 @@ error messages must not become metric dimensions.
 - Only composite cursor configuration and `on_nack: rewind` are accepted; the polling controller implements the corresponding delivery behavior.
 - File checkpoints and leases are library primitives. Scheduling, mapping, and feedback require polling-controller integration; database I/O and node registration remain vendor responsibilities.
 - Multiple named queries, jitter, snapshot/scalar polling, richer output mapping, collection of database metrics as an output signal, and CDC are not implemented. Internal runtime counters are implemented.
-- Byte-limit validation does not enforce process-wide memory pressure, native allocations, or end-to-end execution deadlines.
+- Byte-limit validation does not bound RSS or native allocations. Local memory-pressure state gates new fetches, but full global `MemoryAdmission` accounting is not implemented.
 - Authentication capabilities, credential rotation, TLS configuration, distributed ownership, and automatic source partitioning require separate work.
-- Whole-poll and normal-operation ACK deadlines and immediate backlog catch-up are not implemented.
+- Bounded immediate catch-up is the default, with configurable cycle budgets and memory-pressure new-fetch gating. Whole-poll and normal-operation ACK deadlines are not; elapsed catch-up budgets only gate the next fetch.
 - No exactly-once guarantee, live database qualification, or production performance guarantee is provided by the unit tests.
 
 ## Related Issue
