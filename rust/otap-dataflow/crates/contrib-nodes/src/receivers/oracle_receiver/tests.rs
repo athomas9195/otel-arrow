@@ -28,7 +28,7 @@ fn documented_config() -> Value {
         "query": {
             "statement": COMPOSITE_STATEMENT,
             "interval": "1m",
-            "fetch_size": 300,
+            "fetch_size_rows": 300,
             "max_rows_per_poll": 10000,
             "max_batch_bytes": "10 MiB",
             "timeout": "30s"
@@ -252,7 +252,7 @@ fn requires_every_operational_and_cursor_field() {
 #[test]
 fn collection_defaults_are_applied_without_changing_checkpoint_identity() {
     let mut omitted = documented_config();
-    for field in ["interval", "timeout", "fetch_size"] {
+    for field in ["interval", "timeout", "fetch_size_rows"] {
         _ = omitted["query"]
             .as_object_mut()
             .expect("query")
@@ -261,18 +261,47 @@ fn collection_defaults_are_applied_without_changing_checkpoint_identity() {
     let mut explicit = omitted.clone();
     explicit["query"]["interval"] = serde_json::json!("1m");
     explicit["query"]["timeout"] = serde_json::json!("30s");
-    explicit["query"]["fetch_size"] = serde_json::json!(300);
+    explicit["query"]["fetch_size_rows"] = serde_json::json!(300);
     let defaults = parsed(omitted).expect("default collection settings");
     let configured = parsed(explicit).expect("explicit default settings");
     for config in [&defaults, &configured] {
         assert_eq!(config.query().interval(), Duration::from_secs(60));
         assert_eq!(config.query().timeout(), Duration::from_secs(30));
-        assert_eq!(config.query().fetch_size(), 300);
+        assert_eq!(config.query().fetch_size_rows(), 300);
     }
     assert_eq!(
         defaults.config_fingerprint(),
         configured.config_fingerprint()
     );
+}
+
+/// Scenario: Oracle configuration uses the explicit row-unit name, or the old ambiguous fetch_size field.
+/// Guarantees: The new field preserves its configured value and checkpoint identity; the old field fails rather than silently selecting the default.
+#[test]
+fn fetch_size_rows_preserves_overrides_and_rejects_legacy_name() {
+    let baseline = parsed(documented_config()).expect("default configuration");
+    let mut value = documented_config();
+    value["query"]["fetch_size_rows"] = serde_json::json!(123);
+    let configured = parsed(value.clone()).expect("explicit row count");
+    assert_eq!(configured.query().fetch_size_rows(), 123);
+    assert_eq!(
+        baseline.config_fingerprint(),
+        configured.config_fingerprint()
+    );
+    for include_new_name in [false, true] {
+        let mut legacy = value.clone();
+        legacy["query"]["fetch_size"] = serde_json::json!(50);
+        if !include_new_name {
+            _ = legacy["query"]
+                .as_object_mut()
+                .expect("query")
+                .remove("fetch_size_rows");
+        }
+        assert!(
+            parsed(legacy).is_err(),
+            "legacy setting must not be silently ignored"
+        );
+    }
 }
 
 /// Scenario: The interval uses supported endpoints or fractional minutes equivalent to whole seconds.
@@ -293,7 +322,7 @@ fn collection_interval_accepts_whole_seconds_and_fractional_minutes() {
 /// Guarantees: Invalid values fail configuration instead of receiving defaults or silent rounding.
 #[test]
 fn collection_settings_reject_invalid_values() {
-    for field in ["interval", "timeout", "fetch_size"] {
+    for field in ["interval", "timeout", "fetch_size_rows"] {
         for value in [Value::Null, serde_json::json!("")] {
             let mut config = documented_config();
             config["query"][field] = value;
@@ -323,7 +352,7 @@ fn collection_settings_reject_invalid_values() {
         serde_json::json!(10001),
     ] {
         let mut config = documented_config();
-        config["query"]["fetch_size"] = value;
+        config["query"]["fetch_size_rows"] = value;
         assert!(parsed(config).is_err());
     }
     let mut config = documented_config();
@@ -331,7 +360,7 @@ fn collection_settings_reject_invalid_values() {
     _ = config["query"]
         .as_object_mut()
         .expect("query")
-        .remove("fetch_size");
+        .remove("fetch_size_rows");
     assert!(
         parsed(config).is_err(),
         "default fetch size still obeys explicit page bounds"
@@ -681,7 +710,7 @@ fn emits_oracle_rows_when_live_test_is_enabled() {
                 WHERE (EVENT_TS > :last_timestamp OR (EVENT_TS = :last_timestamp \
                 AND EVENT_ID > :last_tie_breaker)) ORDER BY EVENT_TS ASC, EVENT_ID ASC",
             "interval": "1m",
-            "fetch_size": 10,
+            "fetch_size_rows": 10,
             "max_rows_per_poll": 10,
             "max_batch_bytes": "10 MiB",
             "timeout": "10s"

@@ -551,7 +551,7 @@ fn bounded_fetch_array_size(types: &[OracleType], query: &CompiledQuery) -> u32 
     );
     let byte_limited = query.max_normalized_bytes() / row_bytes.max(1);
     let rows = (query.max_rows() as u64)
-        .min(query.fetch_size() as u64)
+        .min(query.fetch_size_rows() as u64)
         .min(byte_limited)
         .max(1);
     rows as u32

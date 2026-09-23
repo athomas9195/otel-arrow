@@ -33,7 +33,7 @@ groups:
                   )
                   ORDER BY EVENT_TS ASC, EVENT_ID ASC
                 interval: 1m
-                fetch_size: 300
+                fetch_size_rows: 300
                 max_rows_per_poll: 10000
                 # Applied separately to normalized row storage and encoded OTLP.
                 max_batch_bytes: 10 MiB

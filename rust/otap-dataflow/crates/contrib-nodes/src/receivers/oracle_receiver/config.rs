@@ -32,7 +32,7 @@ const fn default_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
-const fn default_fetch_size() -> usize {
+const fn default_fetch_size_rows() -> usize {
     300
 }
 
@@ -250,8 +250,8 @@ struct OracleQueryConfig {
     statement: String,
     #[serde(default = "default_interval", with = "humantime_serde")]
     interval: Duration,
-    #[serde(default = "default_fetch_size")]
-    fetch_size: usize,
+    #[serde(default = "default_fetch_size_rows")]
+    fetch_size_rows: usize,
     max_rows_per_poll: usize,
     #[serde(deserialize_with = "deserialize_byte_size")]
     max_batch_bytes: u64,
@@ -267,7 +267,7 @@ impl OracleQueryConfig {
         PollingConfig {
             interval: self.interval,
             timeout: self.timeout,
-            fetch_size: self.fetch_size,
+            fetch_size_rows: self.fetch_size_rows,
             max_rows_per_poll: self.max_rows_per_poll,
             max_batch_bytes: self.max_batch_bytes,
             catch_up: self.catch_up,

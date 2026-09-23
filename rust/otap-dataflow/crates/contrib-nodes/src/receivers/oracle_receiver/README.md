@@ -130,7 +130,7 @@ your Oracle client and connection security separately for the deployment.
 | --- | --- | --- | --- |
 | `query.statement` | string | **required** | One SELECT in the [supported query shape](#required-query-shape), at most 16 KiB after trimming the optional trailing semicolon and surrounding whitespace. |
 | `query.interval` | duration string | `1m` | Between `1m` and `24h`, inclusive, with whole-second precision. `1.5m` is valid (90 seconds); `60.5s` is not. Delay after a poll cycle ends; acknowledged catch-up pages do not wait this interval. |
-| `query.fetch_size` | integer | `300` | Between `1` and `10000`, and no greater than `max_rows_per_poll`. Target rows per native fetch, further capped by row and byte budgets. |
+| `query.fetch_size_rows` | integer | `300` | Between `1` and `10000`, and no greater than `max_rows_per_poll`. Target rows per native fetch, further capped by row and byte budgets. |
 | `query.max_rows_per_poll` | integer | **required** | Between `1` and `10000`. Maximum rows fetched per page, including catch-up pages. |
 | `query.max_batch_bytes` | byte count or size string | **required** | Between 1 byte and 256 MiB, inclusive. For example, `10485760` or `10 MiB`. Applied separately to normalized row storage and encoded OTLP. |
 | `query.timeout` | duration string | `30s` | Positive whole seconds from `1s` through `5m`. Native Oracle call timeout, not a whole-query, whole-poll or downstream-ACK deadline. |
@@ -142,7 +142,7 @@ budget exhaustion, downstream admission pressure, or a stop request. The receive
 also observes the pipeline's process-memory admission state.
 
 Omitting the three operational settings selects `interval: 1m`, `timeout: 30s`,
-and `fetch_size: 300`. Explicit blank, null, negative or invalid values are
+and `fetch_size_rows: 300`. Explicit blank, null, negative or invalid values are
 rejected, not replaced with defaults or rounded. A configured page limit below
 300 requires an explicitly smaller fetch size. Product configuration may hold
 the timeout and fetch size fixed while still using these native defaults.
@@ -157,6 +157,10 @@ rows are queried again after that cursor. If the first row alone exceeds either
 budget, the receiver fails explicitly rather than skipping the row.
 Native fetch buffers, metadata, allocator overhead, and intermediate
 representations are additional memory; this is not a process-RSS limit.
+
+Earlier pre-release configurations must rename `query.fetch_size` to
+`query.fetch_size_rows`. The old name is rejected, not silently ignored.
+The 300-row default, native fetch bounds, and checkpoint fingerprint are unchanged.
 
 ### Watermark
 
@@ -462,7 +466,7 @@ groups:
                   )
                   ORDER BY EVENT_TS ASC, EVENT_ID ASC
                 interval: 1m
-                fetch_size: 300
+                fetch_size_rows: 300
                 max_rows_per_poll: 10000
                 max_batch_bytes: 10 MiB
                 timeout: 30s
