@@ -1,0 +1,17 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: new_component
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: pipeline
+
+# A brief description of the change. Surround your text with quotes if needed.
+note: Add an opt-in PostgreSQL receiver for incremental query collection over verified TLS.
+
+# Mandatory: One or more tracking issues related to the change.
+issues: [4166]
+
+# Additional information for end users.
+subtext: Requires a read-only account, CA and credential files, and an ordered timestamp/integer cursor. Reuses acknowledgement-gated checkpoints and bounded polling.

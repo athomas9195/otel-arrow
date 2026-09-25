@@ -13,6 +13,8 @@ use std::error::Error;
 /// Stable OpenTelemetry database system identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseSystem {
+    /// PostgreSQL.
+    PostgreSql,
     /// Oracle Database.
     Oracle,
 }
@@ -22,6 +24,7 @@ impl DatabaseSystem {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::PostgreSql => "postgresql",
             Self::Oracle => "oracle.db",
         }
     }
@@ -80,7 +83,7 @@ pub trait DriverAdapter {
 
     /// Executes one compiled query strictly after the committed cursor.
     ///
-    /// Implementations bind the cursor through named database parameters and
+    /// Implementations bind the cursor through named or positional database parameters and
     /// return a bounded page whose rows each carry their own cursor.
     /// Callers must successfully validate this same query with
     /// [`Self::validate_query`] before its first execution. Substitute cursor

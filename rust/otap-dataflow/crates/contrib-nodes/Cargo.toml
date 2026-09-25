@@ -16,6 +16,12 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+otel-arrow-dfe-scraper = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
+sqlparser = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
 # Workspace crates (likely used by most/all features)
 otel-arrow-dfe-channel = { workspace = true }
 otel-arrow-dfe-config = { workspace = true }
@@ -94,6 +100,19 @@ one_collect = { workspace = true, optional = true }
 tracepoint_decode = { workspace = true, optional = true }
 
 [features]
+postgresql-receiver = [
+    "dep:otel-arrow-dfe-scraper",
+    "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:sqlparser",
+    "dep:rustls",
+    "dep:blake3",
+    "dep:chrono",
+    "dep:humantime-serde",
+    "dep:secrecy",
+    "dep:uuid",
+    "dep:tokio-util",
+]
 # Keep these umbrella lists exhaustive. Features can appear in both directional
 # categories when they intentionally include source and destination nodes.
 contrib-nodes = ["contrib-receivers", "contrib-processors", "contrib-exporters"]
@@ -200,6 +219,7 @@ aws = [
 ]
 
 [dev-dependencies]
+tempfile.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true

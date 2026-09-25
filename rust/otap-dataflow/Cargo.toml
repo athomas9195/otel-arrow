@@ -54,6 +54,9 @@ cfg-if.workspace = true
 tikv-jemallocator = { workspace = true, optional = true }
 
 [workspace.dependencies]
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tokio-postgres-rustls = { version = "0.14", default-features = false }
+sqlparser = { version = "0.61", features = ["visitor"] }
 otel-arrow-dfe-admin-api = { version = "0.57.0", path = "crates/admin-api" }
 otel-arrow-dfe-admin-types = { version = "0.57.0", path = "crates/admin-types" }
 otel-arrow-dfe-pdata-otlp-macros = { version = "0.57.0", path = "./crates/pdata/src/otlp/macros"}
@@ -303,6 +306,7 @@ opentelemetry-resource-detectors = "0.13.0"
 otel-arrow-dfe-pdata-views = { path = "crates/pdata-views" }
 
 [features]
+postgresql-receiver = ["otel-arrow-dfe-contrib-nodes/postgresql-receiver"]
 default = ["core-nodes", "dev-tools", "admin-live-logs-ws", "jemalloc", "crypto-ring"]
 
 # Core-node feature forwarding. Keep these lists aligned with

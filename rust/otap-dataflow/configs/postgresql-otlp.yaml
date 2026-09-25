@@ -1,0 +1,57 @@
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          postgresql:
+            type: urn:otel:receiver:postgresql
+            config:
+              source_id: audit
+              connection:
+                host: "${env:POSTGRES_HOST:-localhost}"
+                port: 5432
+                database: "${env:POSTGRES_DATABASE:-events}"
+                tls:
+                  ca_file: "${env:POSTGRES_CA_FILE:-/run/secrets/postgres-ca.pem}"
+              authentication:
+                username_file: "${env:POSTGRES_USERNAME_FILE:-/run/secrets/postgres-user}"
+                password_file: "${env:POSTGRES_PASSWORD_FILE:-/run/secrets/postgres-password}"
+              query:
+                statement: >
+                  SELECT event_ts, event_id, payload FROM public.events
+                  WHERE (event_ts > $1 OR (event_ts = $1 AND event_id > $2))
+                  ORDER BY event_ts ASC, event_id ASC
+                max_rows_per_poll: 10000
+                max_batch_bytes: 10 MiB
+              watermark:
+                mode: composite
+                timestamp:
+                  column: event_ts
+                  bind: last_timestamp
+                  initial: "${env:POSTGRES_INITIAL_TIMESTAMP:-2026-09-25T00:00:00Z}"
+                  timezone: UTC
+                tie_breaker:
+                  column: event_id
+                  bind: last_id
+                  initial: 0
+              checkpoint:
+                directory: ${engine.state_dir}/postgresql
+                on_nack: rewind
+                nack_backoff: 1s
+                max_consecutive_failures: 5
+          otlp:
+            type: exporter:otlp_http
+            config:
+              endpoint: "${env:OTLP_HTTP_ENDPOINT:-https://collector.example.com}"
+              client_pool_size: 1
+              http: {}
+        connections:
+          - from: postgresql
+            to: otlp
