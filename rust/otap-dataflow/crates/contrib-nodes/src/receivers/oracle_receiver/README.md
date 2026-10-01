@@ -17,7 +17,7 @@ releases.
 ## Overview
 
 The Oracle receiver polls an operator-authored, read-only SQL query using a
-composite cursor: a timestamp and a signed integer tie-breaker. It maps returned
+typed scalar cursor or a composite timestamp and signed-integer tie-breaker. It maps returned
 rows to structured OTLP logs and saves acknowledged progress in filesystem
 checkpoints.
 
@@ -33,7 +33,7 @@ exactly once and does not implement every capability proposed in the
 
 ## Getting Started
 
-1. Prepare a source with stable rows and a unique, commit-ordered composite
+1. Prepare a source with stable rows and a unique, commit-ordered scalar or composite
    cursor. Read [Delivery guarantees](#delivery-guarantees) before choosing a
    timestamp column.
 2. Install [Oracle Instant Client](#oracle-instant-client-installation) on the
@@ -52,7 +52,7 @@ fetch size and catch-up budgets have defaults. Unknown fields are rejected.
 ### Native Schema and Design Proposals
 
 This reference documents the implemented native OTEL-Arrow schema, matching the
-updated **composite** configuration design. An upstream deployment system may
+updated database-polling configuration design. An upstream deployment system may
 translate customer settings into this YAML and provision credentials and
 checkpoint storage; pre-DCR/DCR translation and mount orchestration are separate
 deployment work, not implemented by this receiver.
@@ -64,10 +64,10 @@ Do not copy proposed or older schema variants into the native configuration:
   routing belongs to the surrounding pipeline/exporter configuration.
 - `connection.instant_client_dir` is required, even if the loader can already
   find the Oracle libraries. `connection.tns_admin` is not supported.
-- Watermarks use nested `timestamp` and `tie_breaker` objects, explicit `bind`
+- Composite watermarks use nested `timestamp` and `tie_breaker` objects, explicit `bind`
   and `initial` values, and `mode: composite`; flat `timestamp_column`,
   `tie_breaker_column`, and `start_at` fields are not accepted.
-- Scalar and snapshot configurations are proposals, not implemented modes.
+- Scalar mode supports signed integers, unsigned integers, strings, and timestamps. Snapshot mode remains unsupported.
 - A deployment system may choose defaults, but the native schema requires all
   fields marked required, including `max_batch_bytes` and `nack_backoff`.
 
@@ -79,7 +79,7 @@ Do not copy proposed or older schema variants into the native configuration:
 | `connection` | object | **required** | Oracle connection string and Instant Client directory. |
 | `authentication` | object | **required** | Paths to mounted username and password files. |
 | `query` | object | **required** | One SQL statement and its polling, row, byte, and timeout limits. |
-| `watermark` | object | **required** | Composite timestamp/tie-breaker cursor definition and initial position. |
+| `watermark` | object | **required** | Scalar or composite cursor definition and initial position. |
 | `checkpoint` | object | **required** | State directory, NACK policy, replay backoff, and checkpoint-write failure limit. |
 
 These fields belong inside a node's `config:` block, not at the pipeline root.
@@ -164,13 +164,13 @@ The 300-row default, native fetch bounds, and checkpoint fingerprint are unchang
 
 ### Watermark
 
-Only `watermark.mode: composite` is supported. The timestamp and tie-breaker
+`watermark.mode` accepts `composite` or `scalar`. In composite mode, the timestamp and tie-breaker
 form an exclusive lower bound: the first poll selects rows strictly after the
 configured initial pair; subsequent polls use the last committed pair.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `watermark.mode` | string | **required** | Must be `composite`; `scalar` and `snapshot` are not implemented. |
+| `watermark.mode` | string | **required** | `composite` for the fields below; `scalar` uses the separate schema below. Snapshot is unsupported. |
 | `watermark.timestamp.column` | string | **required** | Unquoted Oracle identifier for the timestamp cursor column. |
 | `watermark.timestamp.bind` | string | **required** | Named parameter without `:`. ASCII letters, digits, and `_` only, starting with a letter or `_`. |
 | `watermark.timestamp.initial` | string | **required** | Oracle timestamp text, such as `"1970-01-01 00:00:00"`, with at most nine digits per numeric component. Fractional precision above nine digits is rejected, not truncated. Used only when no checkpoint exists. |
@@ -199,6 +199,93 @@ Timezone offsets are still normalized to UTC without changing the instant.
 The tie-breaker must be unique within each timestamp group. The receiver checks
 column presence, types, and nullability, but cannot prove source uniqueness,
 commit ordering, or immutability.
+
+#### Scalar cursor configuration
+
+A scalar cursor uses one unique, non-null, stable key and one named parameter.
+The starting value is an exclusive lower bound. Do not use a non-unique timestamp
+as a scalar key; retain composite mode when several rows can share a timestamp.
+
+```yaml
+watermark:
+  mode: scalar
+  column: EVENT_ID
+  bind: last_key
+  initial:
+    type: uint64
+    value: 0
+```
+
+For integers and timestamps, the supported predicate and ordering are:
+
+```sql
+SELECT EVENT_ID, PAYLOAD FROM OTAP_ORACLE_EVENTS
+WHERE EVENT_ID > :last_key
+ORDER BY EVENT_ID ASC
+```
+
+Replace the column and bind with the configured names. One enclosing pair of
+predicate parentheses is accepted. Extra predicates, OR branches, non-strict
+comparisons, subqueries, and alternate ordering are rejected, as in composite
+mode. Native parameters are bound directly, never interpolated into SQL text.
+
+| `initial.type` | Oracle column | Value requirements |
+| --- | --- | --- |
+| `int64` | `NUMBER(p,0)` with p=1..19, or native Int64 | Exact signed 64-bit value. Out-of-range rows fail conversion. |
+| `uint64` | `NUMBER(p,0)` with p=1..20, or native UInt64 | Exact unsigned 64-bit value. Negative or out-of-range rows fail conversion. |
+| `timestamp` | DATE or TIMESTAMP family | Parseable UTC timestamp, with no numeric component longer than nine digits. |
+| `string` | VARCHAR2 only | Nonempty UTF-8 text, no NUL, at most 1024 UTF-8 bytes. See collation requirements below. |
+
+All scalar columns must be declared NOT NULL. Unsupported or unspecified numeric
+precision/scale, floating point, decimal/fractional, boolean, RAW, CHAR, and
+national-character cursor types are rejected. A NUMBER column can contain values
+outside the selected Rust integer range; those rows stop progress rather than
+rounding or wrapping. Full uint64 values never pass through i64 or floating point.
+
+Scalar and composite timestamps follow the current PR's native type handling:
+metadata discovery uses a universal zoned bind; subsequent polls use the exact
+Oracle timestamp family and precision. Configured initial timestamps are
+canonicalized to UTC before fingerprinting. Cursors are extracted from the
+already-normalized output row, without a second native decode.
+
+Only timestamp scalar keys are also used as the OTLP event timestamp. Integer
+and string keys remain ordinary body fields; their event time uses the shared
+observation-time fallback instead of treating a key as time.
+
+##### Oracle string ordering
+
+Oracle treats an empty string as SQL NULL, so an empty initial string is invalid.
+Use an explicit nonempty lower bound that is below every desired source key.
+String mode requires an AL32UTF8 database character set, VARCHAR2 cursor metadata,
+and support for Oracle's COLLATE operator. The receiver checks the database
+character set once per connection before preparing the configured query. The
+account must be able to read `NLS_DATABASE_PARAMETERS`; failure is not bypassed.
+
+Both predicate operands and the ordering key must explicitly use BINARY collation:
+
+```sql
+SELECT EVENT_KEY, PAYLOAD FROM OTAP_ORACLE_EVENTS
+WHERE EVENT_KEY COLLATE BINARY > :last_key COLLATE BINARY
+ORDER BY EVENT_KEY COLLATE BINARY ASC
+```
+
+This prevents session or declared column linguistic collation from disagreeing
+with the shared runtime's UTF-8 ordering. See Oracle's
+[COLLATE operator](https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/COLLATE-Operator.html)
+and [comparison rules](https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/Data-Type-Comparison-Rules.html). CHAR padding and national-character
+ordering are not supported. A server/configuration without COLLATE support will
+reject statement preparation; no linguistic fallback is used.
+
+Scalar progress uses the same one-page ACK/NACK and durable checkpoint flow as
+composite progress. Only the last emitted row is committed after ACK and a
+successful write; rejected or byte-deferred rows are re-queried. The mode, key,
+bind, and typed initial value identify scalar checkpoints. The current PR baseline's composite fingerprint schema and checkpoint
+representations are preserved. The upstream UTC normalization change can affect
+fingerprints created with earlier PR revisions; resolve compatibility errors
+explicitly rather than deleting checkpoints or bypassing validation. Switching mode
+or type requires an intentional new checkpoint identity or migration, not
+reinterpreting existing progress. Source commit visibility and retention remain
+requirements for both modes; monotonically allocated IDs alone are insufficient.
 
 ### Checkpoint
 
@@ -279,7 +366,9 @@ instead of returning an error. The adapter propagates conversion errors that
 the driver reports, but does not independently detect or reject these
 replacements. Strict invalid-UTF-8 rejection for database text remains follow-up
 work. Credential files are handled separately and require valid UTF-8; invalid
-credential bytes are rejected.
+credential bytes are rejected. Scalar string cursor columns must contain valid
+UTF-8 source text: replacements can invalidate cursor ordering. If invalid bytes
+are possible, do not use string watermarks until strict decoding is available.
 
 ### Schema Changes
 
@@ -303,7 +392,7 @@ duplicates are possible; exactly-once delivery is not provided.
 | Requirement | Why it is necessary |
 | --- | --- |
 | Commit-visible cursor ordering | Once progress passes a cursor, no transaction may later expose a row at or before that cursor. Increasing IDs or append-only storage alone do not ensure this. |
-| Unique composite cursor | Rows must not share the same timestamp/tie-breaker pair; otherwise a page boundary can exclude an unread row with an equal cursor. |
+| Unique cursor | Rows must not share the same scalar key or timestamp/tie-breaker pair; otherwise a page boundary can exclude an unread row with an equal cursor. |
 | Stable cursor and selected values | A NACK executes the query again, rather than replaying an immutable saved payload. Updates can change both which rows qualify and what they contain. |
 | Sufficient retention | Keep rows available and unchanged throughout the maximum outage, downstream retry, and checkpoint-recovery window. Deletion or expiration before replay can lose the original data. |
 | Stable query semantics | The selected cursor must match the predicate/order values, and the query must continue to describe the same logical stream. |
@@ -706,7 +795,7 @@ checkpoint errors; the Oracle adapter does not rewrite those diagnostics.
 - One query and one pending page per receiver; one pipeline core. Deploy one
   active collector replica per logical source. Automatic partitioning and
   distributed source discovery are not implemented.
-- Composite watermark and `on_nack: rewind`; permanent rejection separately supports `pause` or `retry`. No snapshots, scalar cursor,
+- Scalar or composite watermark and `on_nack: rewind`; permanent rejection separately supports `pause` or `retry`. No snapshots,
   CDC, delete capture, multiple named queries, or configurable output mapping.
 - No whole-poll deadline, normal-operation ACK deadline, or process-RSS ceiling.
 - Only explicitly classified transient database failures retry. Conversion and
