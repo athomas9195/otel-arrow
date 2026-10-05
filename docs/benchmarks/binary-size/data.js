@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791092977606,
+  "lastUpdate": 1791178731540,
   "repoUrl": "https://github.com/athomas9195/otel-arrow",
   "entries": {
     "Benchmark": [
@@ -21265,6 +21265,148 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/athomas9195/otel-arrow/commit/cf19a19b91277efaa6d1c63cd86c49093eeea8f3"
         },
         "date": 1791092967904,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "linux-amd64-text-size",
+            "value": 84.88,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-std",
+            "value": 4.77,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-otel_arrow_dfe_core_nodes",
+            "value": 4.28,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-arrow_array",
+            "value": 3.73,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_expr",
+            "value": 3.52,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_functions_aggregate",
+            "value": 3.04,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_common",
+            "value": 3,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-arrow_cast",
+            "value": 3,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-[Unknown]",
+            "value": 2.98,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_physical_plan",
+            "value": 2.92,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-otel_arrow_dfe_query_engine",
+            "value": 2.7,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-text-size",
+            "value": 72.1,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-std",
+            "value": 4.87,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-otel_arrow_dfe_core_nodes",
+            "value": 3.56,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-arrow_array",
+            "value": 3.55,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_expr",
+            "value": 3.17,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_common",
+            "value": 2.75,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-arrow_cast",
+            "value": 2.49,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_physical_plan",
+            "value": 2.49,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_functions_aggregate",
+            "value": 2.47,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-[Unknown]",
+            "value": 2.41,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-otel_arrow_dfe_query_engine",
+            "value": 2.05,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-binary-size",
+            "value": 117.29,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-binary-size",
+            "value": 104.48,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Cijo Thomas",
+            "username": "cijothomas",
+            "email": "cijo.thomas@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "cf19a19b91277efaa6d1c63cd86c49093eeea8f3",
+          "message": "chore(perf): reject invalid benchmark results (#4050)\n\n## Change summary\n\n- Add configurable validation for finite numeric values in SQL report\nresult tables.\n- Add configurable required-value validation so missing benchmark KPIs\nfail reporting.\n- Apply these checks to GitHub benchmark outputs across the performance\nsuites.\n\n## Motivation\n\n[PR #3888](https://github.com/open-telemetry/otel-arrow/pull/3888)\nremoves traffic-generator producer metrics that the performance reports\nstill consume. Its hosted performance CI completed successfully even\nthough `dropped_logs_percentage` became `NaN` and `logs_produced_rate`\ndisappeared.\n\nThis change turns those invalid or incomplete benchmark results into CI\nfailures. It does not assert machine-dependent performance values; it\nonly requires configured KPIs to be present and numeric results to be\nfinite.\n\n## Changelog\n\nNot required: this changes CI and performance-report validation only.",
+          "timestamp": "2026-09-29T18:56:43Z",
+          "url": "https://github.com/athomas9195/otel-arrow/commit/cf19a19b91277efaa6d1c63cd86c49093eeea8f3"
+        },
+        "date": 1791178717718,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
