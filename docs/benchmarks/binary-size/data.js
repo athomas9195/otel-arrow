@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791267790847,
+  "lastUpdate": 1791352668576,
   "repoUrl": "https://github.com/athomas9195/otel-arrow",
   "entries": {
     "Benchmark": [
@@ -21693,6 +21693,148 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/athomas9195/otel-arrow/commit/3b367dbbd8922109c3053699183411b34d414956"
         },
         "date": 1791267774818,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "linux-amd64-text-size",
+            "value": 86.92,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-std",
+            "value": 4.99,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-otel_arrow_dfe_core_nodes",
+            "value": 4.07,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-arrow_array",
+            "value": 3.99,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_expr",
+            "value": 3.51,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_functions_aggregate",
+            "value": 3.28,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_physical_plan",
+            "value": 3.16,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-datafusion_common",
+            "value": 3.12,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-[Unknown]",
+            "value": 3.03,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-arrow_cast",
+            "value": 3.01,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-crate-otel_arrow_dfe_query_engine",
+            "value": 2.78,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-text-size",
+            "value": 74.12,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-std",
+            "value": 5.06,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-arrow_array",
+            "value": 3.79,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-otel_arrow_dfe_core_nodes",
+            "value": 3.52,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_expr",
+            "value": 3.28,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_common",
+            "value": 2.89,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_physical_plan",
+            "value": 2.75,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-datafusion_functions_aggregate",
+            "value": 2.68,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-arrow_cast",
+            "value": 2.5,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-[Unknown]",
+            "value": 2.44,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-crate-otel_arrow_dfe_pdata",
+            "value": 2.36,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-amd64-binary-size",
+            "value": 120.13,
+            "unit": "MB"
+          },
+          {
+            "name": "linux-arm64-binary-size",
+            "value": 107.35,
+            "unit": "MB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Jake Dern",
+            "username": "JakeDern",
+            "email": "33842784+JakeDern@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "3b367dbbd8922109c3053699183411b34d414956",
+          "message": "chore(perf-test): Add push-based metrics ingestion capabilities to the orchestrator (#4263)\n\n# Change summary\n\nThis PR introduces the OTLP/gRPC metrics component to the benchmark\norchestrator so dfengine components can push their internal metrics\ninstead of being scraped along with a handful of other minor options.\n\n- OtlpMetricsSink: in-memory OTLP MetricsService server; flattens each\nexport into MetricRow-shaped rows (engine-native OTLP names/attributes,\ndelta/ cumulative temporality, engine-assigned start/end timestamps).\n- start/stop suite hooks to run one receiver per suite.\n- extra_hosts support on the docker deployment strategy so containers\ncan reach the host receiver via host.docker.internal:host-gateway.\n- render_template search_paths so configs can include a shared partial.\n- sql_report appends received rows onto the existing in-memory metrics\ntable (single table for scrape and push; a run uses one collection\nmethod).\n\nNo suite uses the receiver yet; scrape-based behavior is unchanged.\n\n## Related issue\n\n- Part of #4229.\n\n## Validation\n\nI've tested the final implementation of the whole series over on my\nfork:\nhttps://github.com/JakeDern/otel-arrow/actions/runs/37337651274/job/111856393989\n \n## User-facing changes\n\nNone.",
+          "timestamp": "2026-10-06T02:27:37Z",
+          "url": "https://github.com/athomas9195/otel-arrow/commit/3b367dbbd8922109c3053699183411b34d414956"
+        },
+        "date": 1791352653958,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
