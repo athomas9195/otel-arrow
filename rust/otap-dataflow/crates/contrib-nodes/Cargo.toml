@@ -63,6 +63,18 @@ http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ryu = { workspace = true, optional = true }
 
+# Common dependency inputs for the same-spec PostgreSQL experiment.
+otel-arrow-dfe-scraper = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+postgres-types = { workspace = true, optional = true }
+postgres-protocol = { workspace = true, optional = true }
+sqlparser = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+
 # ClickHouse exporter dependencies (optional, behind feature flag)
 clickhouse = { workspace = true, optional = true }
 clickhouse-ext-arrow = { workspace = true, optional = true }
@@ -100,6 +112,7 @@ contrib-nodes = ["contrib-receivers", "contrib-processors", "contrib-exporters"]
 contrib-receivers = [
     "etw",
     "kafka",
+    "postgresql-receiver",
     "user-events",
 ]
 contrib-processors = [
@@ -131,6 +144,19 @@ kafka = [
 ]
 
 # Receivers.
+postgresql-receiver = [
+    "dep:otel-arrow-dfe-scraper",
+    "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:sqlparser",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:chrono",
+    "dep:secrecy",
+    "dep:blake3",
+    "dep:humantime-serde",
+    "serde_json/raw_value",
+]
 etw = ["dep:one_collect", "dep:humantime-serde"]
 user-events = [
     "dep:base64",
@@ -200,6 +226,11 @@ aws = [
 ]
 
 [dev-dependencies]
+tempfile.workspace = true
+otel-arrow-dfe-test-tls-certs.workspace = true
+tokio-rustls.workspace = true
+rustls = { workspace = true, features = ["ring"] }
+tonic.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -265,6 +296,11 @@ required-features = ["condense-attributes-bench"]
 name = "otlp_kql_recordset"
 path = "tests/processors/recordset_kql_processor/otlp_kql_recordset.rs"
 required-features = ["recordset-kql"]
+
+[[example]]
+name = "postgresql_e2e"
+path = "examples/postgresql_e2e.rs"
+required-features = ["postgresql-receiver"]
 
 [[example]]
 name = "mock_la_server"

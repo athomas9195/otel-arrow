@@ -1,0 +1,75 @@
+# PostgreSQL 15 integration fixture; materialize secrets and a trusted CA externally.
+# Build df_engine with postgresql-receiver,otlp,crypto-ring.
+version: otel_dataflow/v1
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  database:
+    pipelines:
+      pg_fixture:
+        type: otap
+        policies:
+          channel_capacity:
+            control:
+              node: 16
+              pipeline: 16
+            pdata: 1
+        nodes:
+          pg:
+            type: urn:otel:receiver:postgresql
+            config:
+              source_id: orders-audit
+              connection:
+                host: localhost
+                port: 5432
+                database: receiver_fixture
+                username_file: '${env:PG_USERNAME_FILE}'
+                password_file: '${env:PG_PASSWORD_FILE}'
+                tls:
+                  ca_file: '${env:PG_CA_FILE}'
+              query:
+                sql: |
+                  SELECT e.event_ts, e.event_id, e.actor, e.amount, e.payload
+                  FROM public.receiver_events AS e
+                  WHERE ((e.event_ts > :last_timestamp) OR
+                          (e.event_ts = :last_timestamp AND e.event_id > :last_tie_breaker))
+                  ORDER BY e.event_ts ASC, e.event_id ASC
+                interval: 1m
+                result_schema:
+                  - {name: event_ts, source_type: timestamptz, nullable: false, type_modifier: 6}
+                  - {name: event_id, source_type: int8, nullable: false, type_modifier: -1}
+                  - {name: actor, source_type: text, nullable: false, type_modifier: -1}
+                  - {name: amount, source_type: numeric, nullable: false, type_modifier: -1}
+                  - {name: payload, source_type: jsonb, nullable: false, type_modifier: -1}
+                watermark:
+                  mode: composite
+                  timestamp:
+                    column: event_ts
+                    bind: last_timestamp
+                    initial: "2026-10-05T00:00:00.000000Z"
+                    timezone: UTC
+                  tie_breaker:
+                    column: event_id
+                    bind: last_tie_breaker
+                    initial: 0
+                output:
+                  timestamp_column: event_ts
+              checkpoint:
+                directory: '${env:PG_CHECKPOINT_DIRECTORY}'
+                on_nack: rewind
+                on_permanent_nack: pause
+                nack_backoff: 1s
+                max_consecutive_failures: 5
+          capture:
+            type: urn:otel:exporter:otlp_grpc
+            config:
+              grpc_endpoint: "http://127.0.0.1:4317"
+              timeout: 5s
+              max_in_flight: 1
+              num_connections: 1
+        connections:
+          - from: pg
+            to: capture

@@ -3413,35 +3413,53 @@ groups: {}
         assert!(error.to_string().contains("context"));
     }
 
+    /// Scenario: All bundled configurations are parsed without deployment secrets in the environment.
+    /// Guarantees: Required PostgreSQL path substitutions are scoped to this test and restored afterward.
     #[test]
     fn bundled_configs_parse_as_engine_configs() {
-        let mut dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs")];
-        while let Some(dir) = dirs.pop() {
-            for entry in fs::read_dir(&dir).unwrap_or_else(|e| {
-                panic!("failed to read configs directory {}: {e}", dir.display())
-            }) {
-                let path = entry.expect("failed to read dir entry").path();
-                if path.is_dir() {
-                    dirs.push(path);
-                    continue;
-                }
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        let username = fixture.path().join("username");
+        let password = fixture.path().join("password");
+        let ca = fixture.path().join("ca.pem");
+        let checkpoint = fixture.path().join("checkpoint");
+        temp_env::with_vars(
+            [
+                ("PG_USERNAME_FILE", Some(username.as_os_str())),
+                ("PG_PASSWORD_FILE", Some(password.as_os_str())),
+                ("PG_CA_FILE", Some(ca.as_os_str())),
+                ("PG_CHECKPOINT_DIRECTORY", Some(checkpoint.as_os_str())),
+            ],
+            || {
+                let mut dirs =
+                    vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs")];
+                while let Some(dir) = dirs.pop() {
+                    for entry in fs::read_dir(&dir).unwrap_or_else(|e| {
+                        panic!("failed to read configs directory {}: {e}", dir.display())
+                    }) {
+                        let path = entry.expect("failed to read dir entry").path();
+                        if path.is_dir() {
+                            dirs.push(path);
+                            continue;
+                        }
 
-                let is_yaml = matches!(
-                    path.extension().and_then(|ext| ext.to_str()),
-                    Some("yaml" | "yml")
-                );
-                if !is_yaml {
-                    continue;
-                }
+                        let is_yaml = matches!(
+                            path.extension().and_then(|ext| ext.to_str()),
+                            Some("yaml" | "yml")
+                        );
+                        if !is_yaml {
+                            continue;
+                        }
 
-                let parsed = OtelDataflowSpec::from_file(&path);
-                assert!(
-                    parsed.is_ok(),
-                    "failed to parse engine config {}: {parsed:?}",
-                    path.display()
-                );
-            }
-        }
+                        let parsed = OtelDataflowSpec::from_file(&path);
+                        assert!(
+                            parsed.is_ok(),
+                            "failed to parse engine config {}: {parsed:?}",
+                            path.display()
+                        );
+                    }
+                }
+            },
+        );
     }
 
     /// Kubernetes CRD compatibility tests.

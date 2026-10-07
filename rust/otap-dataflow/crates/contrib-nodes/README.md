@@ -58,6 +58,7 @@ Receivers ingest data into a pipeline.
 | --- | --- | --- | --- |
 | `receiver:etw` | `etw` | Experimental | Ingests Event Tracing for Windows events as logs. |
 | [`receiver:kafka`](src/receivers/kafka_receiver/README.md) | `kafka` | Experimental | Consumes traces, metrics, and logs from Kafka. |
+| [`receiver:postgresql`](src/receivers/postgresql_receiver/README.md) | `postgresql-receiver` | Experimental | Polls PostgreSQL 15 with composite cursors and acknowledged durable progress. |
 | [`receiver:user_events`](src/receivers/user_events_receiver/README.md) | `user-events` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
 
 ## Processors
@@ -95,6 +96,9 @@ registered into the OTAP pipeline factory maps.
 Features describe what the build includes rather than implementation
 directions. Each uses an unsuffixed name so future source or destination nodes
 can join it without changing the public feature contract.
+
+The bounded PostgreSQL experiment uses the explicitly specified
+`postgresql-receiver` feature; it is also included in `contrib-receivers`.
 
 ## Maintenance Notes
 

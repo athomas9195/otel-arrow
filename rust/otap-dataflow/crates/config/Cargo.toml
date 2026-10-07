@@ -35,6 +35,7 @@ k8s-openapi = { workspace = true }
 kube = { workspace = true }
 schemars = { workspace = true }
 tempfile = { workspace = true }
+temp-env = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true, features = ["ring"] }

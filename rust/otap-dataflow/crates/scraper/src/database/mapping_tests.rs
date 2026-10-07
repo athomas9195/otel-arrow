@@ -149,6 +149,36 @@ fn field_value<'a>(record: &'a LogRecord, key: &str) -> &'a any_value::Value {
         .expect("body field should have a value")
 }
 
+/// Scenario: A PostgreSQL page uses the unchanged shared OTLP mapping.
+/// Guarantees: The PostgreSQL semantic identity is emitted without changing exact byte values.
+#[test]
+fn postgresql_semantic_identity() {
+    let encoded = encode_page(
+        page(
+            vec![column("payload", "bytea")],
+            vec![Row {
+                values: vec![CellValue::Bytes(vec![0, 255])],
+            }],
+        ),
+        DatabaseSystem::PostgreSQL,
+        "pg-source",
+        &OutputConfig::default(),
+        123,
+        UNLIMITED_BYTES,
+    )
+    .expect("encode")
+    .expect("page");
+    let logs = decode(encoded);
+    let resource = logs.resource_logs[0].resource.as_ref().expect("resource");
+    assert!(resource.attributes.iter().any(|a| a.key == "db.system.name"
+        && matches!(a.value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(any_value::Value::StringValue(value)) if value == "postgresql")));
+    assert!(
+        matches!(field_value(&logs.resource_logs[0].scope_logs[0].log_records[0], "payload"),
+        any_value::Value::BytesValue(value) if value == &[0, 255])
+    );
+}
+
 /// Scenario: One row contains every value in the closed CellValue model.
 /// Guarantees: OTLP preserves the exact scalar mapping, structured JSON body, resource and scope
 /// identity, one-row-per-record cardinality, and configured event and observation timestamps.

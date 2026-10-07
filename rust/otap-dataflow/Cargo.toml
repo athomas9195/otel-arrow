@@ -179,6 +179,8 @@ pretty_assertions = "1.4.1"
 pprof = { version = "0.15", features = ["prost-codec"] }
 proc-macro2 = "1.0"
 prometheus = "0.14.0"
+postgres-types = "=0.2.14"
+postgres-protocol = "=0.6.12"
 prost = "0.14"
 prost-types = "0.14"
 quote = "1.0"
@@ -210,6 +212,7 @@ hex = "0.4.3"
 replace_with = "0.1.8"
 simdutf8 = "0.1.5"
 slotmap = "1.0.7"
+sqlparser = { version = "=0.61.0", default-features = false, features = ["std", "recursive-protection"] }
 smallvec = { version = "1.15" , features = ["union", "const_new"] }
 socket2 = { version = "0.6.1", features = ["all"] }
 ipnet = "2.11.0"
@@ -224,6 +227,8 @@ tracing-subscriber = { version = "0.3", default-features = false }
 tokio = { version = "1.48.0", features = ["rt", "time", "net", "io-util", "sync", "macros", "rt-multi-thread", "fs", "io-std", "process", "signal"] }
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
 tokio-stream = "0.1.17"
+tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime", "with-chrono-0_4"] }
+tokio-postgres-rustls = { version = "=0.14.0", default-features = false }
 tokio-util = { version = "0.7.17" }
 tonic = { version = "0.14", default-features = false, features = [
     "channel",
@@ -336,6 +341,7 @@ parquet = ["otel-arrow-dfe-core-nodes/parquet"]
 # `crates/contrib-nodes/Cargo.toml`.
 contrib-nodes = ["otel-arrow-dfe-contrib-nodes/contrib-nodes"]
 contrib-receivers = ["otel-arrow-dfe-contrib-nodes/contrib-receivers"]
+postgresql-receiver = ["otel-arrow-dfe-contrib-nodes/postgresql-receiver"]
 contrib-processors = ["otel-arrow-dfe-contrib-nodes/contrib-processors"]
 contrib-exporters = ["otel-arrow-dfe-contrib-nodes/contrib-exporters"]
 

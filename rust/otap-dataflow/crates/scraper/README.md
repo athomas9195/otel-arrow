@@ -25,6 +25,10 @@ and ties the receiver's identity to that store. The polling component
 `DatabaseReceiver` integrates this binding with OTLP mapping and downstream feedback.
 A concrete vendor receiver supplies the adapter and registers the node.
 
+`DatabaseSystem` identifies Oracle as `oracle.db` and PostgreSQL as `postgresql`.
+The optional contrib `postgresql-receiver` uses these unchanged shared contracts;
+its native driver dependencies do not enter this crate.
+
 | Component | Responsibility |
 | --- | --- |
 | Database contracts | Configuration validation, query plans, adapter interfaces, row/cursor/page types, and size-accounting helpers |
