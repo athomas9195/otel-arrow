@@ -3,7 +3,10 @@
 
 //! Capacity-one local proxy. The shared receiver owns polling and feedback.
 
-use super::{config::Validated, worker};
+use super::{
+    config::{OPERATION_TIMEOUT, Validated},
+    worker,
+};
 use async_trait::async_trait;
 use otel_arrow_dfe_engine::capability::auth::BasicAuthCredential;
 use otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BASIC_AUTH_CREDENTIAL_USABLE_MARGIN;
@@ -118,7 +121,7 @@ impl PostgreSqlAdapter {
         let credential = tokio::select! {
             biased;
             _ = self.operation.notify.notified() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(std::time::Duration::from_secs(30), self.credentials.get_credential()) => {
+            result = tokio::time::timeout(OPERATION_TIMEOUT, self.credentials.get_credential()) => {
                 result.map_err(|_| Error::Credential)?.map_err(|_| Error::Credential)?
             }
         };
@@ -161,7 +164,13 @@ impl DriverAdapter for PostgreSqlAdapter {
         Ok(Cancellation(self.operation.clone()))
     }
     fn is_retryable(error: &Error) -> bool {
-        matches!(error, Error::Unavailable | Error::Cancelled)
+        matches!(
+            error,
+            Error::Unavailable | Error::Cancelled | Error::Timeout
+        )
+    }
+    fn retry_at_next_interval(error: &Error) -> bool {
+        matches!(error, Error::Timeout)
     }
     async fn reconnect(&mut self, _: &CompiledQuery) -> Result<()> {
         match self.request(Action::Reconnect).await? {
@@ -171,7 +180,7 @@ impl DriverAdapter for PostgreSqlAdapter {
     }
     async fn validate_query(&mut self, _: &CompiledQuery) -> Result<Vec<ColumnMetadata>> {
         match self.request(Action::Validate).await? {
-            Reply::Columns(c) => Ok(c),
+            Reply::Columns(columns) => Ok(columns),
             _ => Err(Error::Cleanup),
         }
     }
@@ -185,7 +194,7 @@ impl DriverAdapter for PostgreSqlAdapter {
             Cursor::Scalar(_) => return Err(Error::Config),
         };
         match self.request(Action::Execute(cursor.clone())).await? {
-            Reply::Page(p) => Ok(p),
+            Reply::Page(page) => Ok(page),
             _ => Err(Error::Cleanup),
         }
     }
@@ -228,7 +237,7 @@ impl DriverAdapter for PostgreSqlAdapter {
             Error::Config | Error::Sql | Error::Metadata | Error::Credential => {
                 ReceiverErrorKind::Configuration
             }
-            Error::Value | Error::Limit | Error::Database | Error::Unavailable => {
+            Error::Value | Error::Limit | Error::Database | Error::Unavailable | Error::Timeout => {
                 ReceiverErrorKind::Transport
             }
             Error::Cancelled | Error::Cleanup => ReceiverErrorKind::Shutdown,
@@ -262,6 +271,8 @@ pub(crate) enum Error {
     Unavailable,
     #[error("postgresql: cancelled operation stopped")]
     Cancelled,
+    #[error("postgresql: query timed out after cleanup")]
+    Timeout,
     #[error("postgresql: cleanup unconfirmed; source requires process restart")]
     Cleanup,
 }
@@ -270,15 +281,7 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn database(error: tokio_postgres::Error) -> Error {
     if let Some(code) = error.code() {
-        if code.code() == "57014" {
-            Error::Cancelled
-        } else if code.code().starts_with("08")
-            || matches!(code.code(), "57P01" | "57P02" | "57P03")
-        {
-            Error::Unavailable
-        } else {
-            Error::Database
-        }
+        sqlstate(code.code())
     } else if error.is_closed() {
         Error::Unavailable
     } else {
@@ -295,12 +298,28 @@ pub(crate) fn database(error: tokio_postgres::Error) -> Error {
                         | std::io::ErrorKind::NotConnected
                         | std::io::ErrorKind::TimedOut
                         | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
                 )
             {
                 return Error::Unavailable;
             }
             source = value.source();
         }
+        Error::Database
+    }
+}
+
+fn sqlstate(code: &str) -> Error {
+    if code == "57014" {
+        Error::Timeout
+    } else if code.starts_with("08")
+        || matches!(
+            code,
+            "53300" | "57P01" | "57P02" | "57P03" | "40001" | "40P01"
+        )
+    {
+        Error::Unavailable
+    } else {
         Error::Database
     }
 }

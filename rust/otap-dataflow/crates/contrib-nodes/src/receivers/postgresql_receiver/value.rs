@@ -11,6 +11,9 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
 use otel_arrow_dfe_scraper::database::{CellValue, CompositeCursor, CursorRow, Row};
 use tokio_postgres::types::{FromSql, Type};
 
+const MAX_ROW_BYTES: usize = 1024 * 1024;
+const MAX_NUMERIC_CHARS: usize = 16_384;
+
 pub(crate) fn native_type(name: &str) -> Result<Type> {
     Ok(match name {
         "bool" => Type::BOOL,
@@ -57,15 +60,22 @@ pub(crate) fn cursor_time(text: &str, modifier: i32) -> Result<DateTime<Utc>> {
     let dt = DateTime::parse_from_rfc3339(text)
         .map_err(|_| Error::Value)?
         .with_timezone(&Utc);
+    validate_timestamp(dt.naive_utc(), modifier)?;
+    Ok(dt)
+}
+
+fn validate_timestamp(dt: NaiveDateTime, modifier: i32) -> Result<()> {
     let precision = if modifier == -1 { 6 } else { modifier };
     if !(0..=6).contains(&precision)
         || !(1..=9999).contains(&dt.year())
         || dt.nanosecond() >= 1_000_000_000
-        || dt.nanosecond() % 10u32.pow(9 - precision as u32) != 0
+        || !dt
+            .nanosecond()
+            .is_multiple_of(10u32.pow(9 - precision as u32))
     {
         return Err(Error::Value);
     }
-    Ok(dt)
+    Ok(())
 }
 
 pub(crate) fn check_tie(value: i64, ty: &str) -> Result<()> {
@@ -86,8 +96,10 @@ impl<'a> FromSql<'a> for Raw<'a> {
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         Ok(Self(raw))
     }
-    fn accepts(ty: &Type) -> bool {
-        native_type(ty.name()).is_ok()
+    fn accepts(_: &Type) -> bool {
+        // This private wrapper only borrows bytes. Catalog/prepared-statement
+        // validation establishes the types; the cached decoder checks values.
+        true
     }
 }
 
@@ -100,7 +112,10 @@ fn epoch() -> Result<NaiveDateTime> {
         .ok_or(Error::Value)
 }
 fn timestamp(bytes: &[u8]) -> Result<NaiveDateTime> {
-    let micros = i64::from_be_bytes(array(bytes)?);
+    timestamp_micros(i64::from_be_bytes(array(bytes)?))
+}
+
+fn timestamp_micros(micros: i64) -> Result<NaiveDateTime> {
     if matches!(micros, i64::MIN | i64::MAX) {
         return Err(Error::Value);
     }
@@ -112,8 +127,55 @@ fn timestamp(bytes: &[u8]) -> Result<NaiveDateTime> {
     }
     Ok(dt)
 }
+
+fn write_timestamp(text: &mut String, dt: NaiveDateTime) -> Result<()> {
+    use std::fmt::Write;
+    write!(
+        text,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        dt.nanosecond() / 1000,
+    )
+    .map_err(|_| Error::Value)
+}
+
+fn timestamp_text(dt: NaiveDateTime) -> Result<String> {
+    let mut text = String::with_capacity(27);
+    write_timestamp(&mut text, dt)?;
+    Ok(text)
+}
+
+#[derive(Default)]
+pub(crate) struct CursorTimestampCache {
+    last: Option<(i64, i32, NaiveDateTime)>,
+    text: String,
+}
+
+impl CursorTimestampCache {
+    fn decode(&mut self, bytes: &[u8], modifier: i32) -> Result<(NaiveDateTime, &str)> {
+        let micros = i64::from_be_bytes(array(bytes)?);
+        if let Some((previous, precision, dt)) = &self.last
+            && *previous == micros
+            && *precision == modifier
+        {
+            return Ok((*dt, &self.text));
+        }
+        let dt = timestamp_micros(micros)?;
+        validate_timestamp(dt, modifier)?;
+        self.text.clear();
+        write_timestamp(&mut self.text, dt)?;
+        self.last = Some((micros, modifier, dt));
+        Ok((dt, &self.text))
+    }
+}
+
 fn text(bytes: &[u8]) -> Result<&str> {
-    if bytes.len() > 1024 * 1024 {
+    if bytes.len() > MAX_ROW_BYTES {
         return Err(Error::Limit);
     }
     std::str::from_utf8(bytes).map_err(|_| Error::Value)
@@ -156,7 +218,7 @@ pub(crate) fn numeric(bytes: &[u8]) -> Result<String> {
         highest as usize * 4 + d.to_string().len()
     };
     let length = integer_len + usize::from(scale > 0) + scale + usize::from(sign != 0);
-    if length > 16384 {
+    if length > MAX_NUMERIC_CHARS {
         return Err(Error::Limit);
     }
     let digit_at = |power: i32| -> u16 {
@@ -213,21 +275,13 @@ pub(crate) fn decode(ty: &Type, bytes: &[u8]) -> Result<CellValue> {
         }
         Type::TEXT | Type::VARCHAR | Type::BPCHAR => CellValue::String(text(bytes)?.into()),
         Type::BYTEA => {
-            if bytes.len() > 1024 * 1024 {
+            if bytes.len() > MAX_ROW_BYTES {
                 return Err(Error::Limit);
             }
             CellValue::Bytes(bytes.into())
         }
-        Type::TIMESTAMP => CellValue::Timestamp(
-            timestamp(bytes)?
-                .format("%Y-%m-%dT%H:%M:%S%.6f")
-                .to_string(),
-        ),
-        Type::TIMESTAMPTZ => CellValue::TimestampTz(
-            timestamp(bytes)?
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string(),
-        ),
+        Type::TIMESTAMP => CellValue::Timestamp(timestamp_text(timestamp(bytes)?)?),
+        Type::TIMESTAMPTZ => CellValue::TimestampTz(timestamp_text(timestamp(bytes)?)?),
         Type::DATE => {
             let days = i32::from_be_bytes(array(bytes)?);
             let date = epoch()?
@@ -278,16 +332,24 @@ pub(crate) fn decode(ty: &Type, bytes: &[u8]) -> Result<CellValue> {
     })
 }
 
+pub(crate) type CursorPosition = (NaiveDateTime, i64);
+
+pub(crate) struct DecodedRow {
+    pub row: CursorRow,
+    pub position: CursorPosition,
+}
+
 pub(crate) fn row(
     native: &tokio_postgres::Row,
     plan: &Plan,
-    event: Option<&str>,
-) -> Result<CursorRow> {
-    if native.len() != plan.expected.len() || native.raw_size_bytes() > 1024 * 1024 {
+    timestamp_cache: &mut CursorTimestampCache,
+) -> Result<DecodedRow> {
+    if native.len() != plan.expected.len() || native.raw_size_bytes() > MAX_ROW_BYTES {
         return Err(Error::Limit);
     }
     let mut values = Vec::with_capacity(native.len());
-    for (i, col) in plan.expected.iter().enumerate() {
+    let mut cursor_timestamp = None;
+    for (i, (col, native_type)) in plan.expected.iter().zip(&plan.native_types).enumerate() {
         let value = match native
             .try_get::<_, Option<Raw<'_>>>(i)
             .map_err(|_| Error::Value)?
@@ -298,40 +360,33 @@ pub(crate) fn row(
                 }
                 CellValue::Null
             }
-            Some(raw) => decode(&native_type(&col.source_type)?, raw.0)?,
-        };
-        if event.is_some_and(|e| e.eq_ignore_ascii_case(&col.name)) {
-            match &value {
-                CellValue::Timestamp(v) | CellValue::TimestampTz(v) => {
-                    let dt = cursor_time(&utc_text(v), col.type_modifier)?;
-                    let _ = u64::try_from(dt.timestamp())
-                        .ok()
-                        .and_then(|s| s.checked_mul(1_000_000_000))
-                        .and_then(|ns| ns.checked_add(dt.nanosecond() as u64))
-                        .ok_or(Error::Value)?;
+            Some(raw) if i == plan.timestamp => {
+                let (dt, text) = timestamp_cache.decode(raw.0, col.type_modifier)?;
+                cursor_timestamp = Some(dt);
+                match *native_type {
+                    Type::TIMESTAMP => CellValue::Timestamp(text.to_owned()),
+                    Type::TIMESTAMPTZ => CellValue::TimestampTz(text.to_owned()),
+                    _ => return Err(Error::Metadata),
                 }
-                _ => return Err(Error::Value),
             }
-        }
+            Some(raw) => decode(native_type, raw.0)?,
+        };
         values.push(value);
     }
     let timestamp = match &values[plan.timestamp] {
-        CellValue::Timestamp(v) | CellValue::TimestampTz(v) => utc_text(v),
+        CellValue::Timestamp(v) | CellValue::TimestampTz(v) => v.clone(),
         _ => return Err(Error::Value),
     };
     let CellValue::Int64(tie) = values[plan.tie] else {
         return Err(Error::Value);
     };
-    let _ = cursor_time(&timestamp, plan.expected[plan.timestamp].type_modifier)?;
-    Ok(CursorRow {
-        row: Row { values },
-        cursor: CompositeCursor::new(timestamp, tie).into(),
+    Ok(DecodedRow {
+        row: CursorRow {
+            row: Row { values },
+            cursor: CompositeCursor::new(timestamp, tie).into(),
+        },
+        position: (cursor_timestamp.ok_or(Error::Value)?, tie),
     })
 }
-fn utc_text(text: &str) -> String {
-    if text.ends_with('Z') {
-        text.to_owned()
-    } else {
-        format!("{text}Z")
-    }
-}
+#[cfg(test)]
+postgresql_module_tests!(value);

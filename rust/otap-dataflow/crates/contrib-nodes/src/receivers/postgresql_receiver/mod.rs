@@ -10,8 +10,8 @@ mod tests;
 
 mod adapter;
 mod config;
+mod framing;
 mod query;
-mod transport;
 mod value;
 mod worker;
 
@@ -43,9 +43,7 @@ pub const POSTGRESQL_RECEIVER_URN: &str = "urn:otel:receiver:postgresql";
 /// Registers the opt-in local PostgreSQL receiver.
 pub static POSTGRESQL_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     name: POSTGRESQL_RECEIVER_URN,
-    create: |pipeline, node, node_config, receiver_config, capabilities| {
-        create(pipeline, node, node_config, receiver_config, capabilities)
-    },
+    create,
     validate_config: |value| {
         config::PostgreSqlReceiverConfig::parse(value)
             .and_then(config::PostgreSqlReceiverConfig::validate)

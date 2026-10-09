@@ -18,7 +18,63 @@ use sqlparser::{
     tokenizer::{Token, Tokenizer},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use tokio_postgres::{Transaction, types::Type};
+use tokio_postgres::{GenericClient, Transaction, types::Type};
+
+pub(crate) const MAX_PAGE_ROWS: usize = 1000;
+
+const RELATION_SQL: &str = "SELECT c.oid, c.relkind::text, c.relpersistence::text, c.relrowsecurity, \
+     EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) \
+     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+     WHERE n.nspname=$1 AND c.relname=$2 LIMIT 2";
+const ATTRIBUTES_SQL: &str = "SELECT a.attname::text,a.attnum,a.atttypid,a.atttypmod,a.attnotnull,a.attcollation,t.typcollation \
+     FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid \
+     WHERE a.attrelid=$1 AND a.attname=ANY($2) AND a.attnum>0 AND NOT a.attisdropped \
+     LIMIT (pg_catalog.cardinality($2) + 1)";
+const INDEXES_SQL: &str = "SELECT i.indkey::smallint[], i.indnkeyatts, i.indexrelid FROM pg_catalog.pg_index i \
+     WHERE i.indrelid=$1 AND i.indisunique AND i.indisvalid AND i.indisready \
+     AND i.indimmediate AND i.indpred IS NULL AND i.indexprs IS NULL \
+     AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(i.indclass::oid[]) k(oid) \
+       JOIN pg_catalog.pg_opclass o ON o.oid=k.oid \
+       JOIN pg_catalog.pg_namespace n ON n.oid=o.opcnamespace WHERE n.nspname<>'pg_catalog') \
+     AND NOT EXISTS (SELECT 1 FROM pg_catalog.generate_series(0,i.indnkeyatts-1) k(n) \
+       JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[k.n] \
+       WHERE i.indcollation[k.n]<>a.attcollation) \
+     ORDER BY i.indexrelid LIMIT 129";
+
+pub(crate) struct CatalogStatements {
+    relation: tokio_postgres::Statement,
+    attributes: tokio_postgres::Statement,
+    indexes: tokio_postgres::Statement,
+}
+
+impl CatalogStatements {
+    pub async fn prepare(
+        client: &impl GenericClient,
+        operation: &super::adapter::Operation,
+    ) -> Result<Self> {
+        operation.check()?;
+        let relation = client
+            .prepare_typed(RELATION_SQL, &[Type::TEXT, Type::TEXT])
+            .await
+            .map_err(database)?;
+        operation.check()?;
+        let attributes = client
+            .prepare_typed(ATTRIBUTES_SQL, &[Type::OID, Type::TEXT_ARRAY])
+            .await
+            .map_err(database)?;
+        operation.check()?;
+        let indexes = client
+            .prepare_typed(INDEXES_SQL, &[Type::OID])
+            .await
+            .map_err(database)?;
+        operation.check()?;
+        Ok(Self {
+            relation,
+            attributes,
+            indexes,
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ColumnRef {
@@ -40,12 +96,13 @@ pub(crate) struct Plan {
     pub referenced: BTreeSet<ColumnRef>,
     pub filters: Vec<(ColumnRef, Option<Value>)>,
     pub expected: Vec<ExpectedColumn>,
+    pub native_types: Vec<Type>,
     pub timestamp: usize,
     pub tie: usize,
 }
 
 fn identifier(id: &Ident) -> Result<String> {
-    super::config::name(&id.value, 63).map_err(|_| Error::Sql)?;
+    super::config::validate_name(&id.value, 63).map_err(|_| Error::Sql)?;
     Ok(if id.quote_style.is_some() {
         id.value.clone()
     } else {
@@ -97,6 +154,53 @@ fn keyset(expr: &Expr, ts: &ColumnRef, tie: &ColumnRef) -> bool {
                 && column(&l[1]).as_ref() == Ok(tie) && bind(&r[0], "$1") && bind(&r[1], "$2"))
         }
         _ => false,
+    }
+}
+
+fn canonicalize_keyset(expr: &mut Expr, ts: &ColumnRef, tie: &ColumnRef) {
+    if let Expr::Nested(inner) = expr {
+        canonicalize_keyset(inner, ts, tie);
+        return;
+    }
+    if keyset(expr, ts, tie)
+        && let Expr::BinaryOp {
+            left,
+            op: Op::Or,
+            right,
+        } = expr
+        && let Expr::BinaryOp {
+            left: timestamp,
+            right: timestamp_bind,
+            ..
+        } = unnest(left)
+        && let Expr::BinaryOp { right, .. } = unnest(right)
+        && let Expr::BinaryOp {
+            left: id,
+            right: id_bind,
+            ..
+        } = unnest(right)
+    {
+        // Catalog proof requires native, non-null cursor columns; their built-in
+        // comparisons make this exact OR keyset equivalent to row comparison.
+        *expr = Expr::BinaryOp {
+            left: Box::new(Expr::Tuple(vec![
+                unnest(timestamp).clone(),
+                unnest(id).clone(),
+            ])),
+            op: Op::Gt,
+            right: Box::new(Expr::Tuple(vec![
+                unnest(timestamp_bind).clone(),
+                unnest(id_bind).clone(),
+            ])),
+        };
+    } else if let Expr::BinaryOp {
+        left,
+        op: Op::And,
+        right,
+    } = expr
+    {
+        canonicalize_keyset(left, ts, tie);
+        canonicalize_keyset(right, ts, tie);
     }
 }
 
@@ -429,7 +533,7 @@ impl Plan {
             return Err(Error::Sql);
         }
         // Equality with an allowlisted reconstruction rejects every unexamined
-        // query/select field, including new parser fields, without executing a rewrite.
+        // query/select field, including new parser fields, before any rewrite.
         let projection = select
             .projection
             .iter()
@@ -458,6 +562,12 @@ impl Plan {
         {
             return Err(Error::Sql);
         }
+        let mut optimized = query.clone();
+        let SetExpr::Select(select) = optimized.body.as_mut() else {
+            return Err(Error::Sql);
+        };
+        canonicalize_keyset(select.selection.as_mut().ok_or(Error::Sql)?, ts, id);
+        let sql = format!("{optimized} LIMIT {MAX_PAGE_ROWS}");
         Ok(Self {
             sql,
             relations,
@@ -465,6 +575,10 @@ impl Plan {
             referenced,
             filters,
             expected: expected.to_vec(),
+            native_types: expected
+                .iter()
+                .map(|column| super::value::native_type(&column.source_type))
+                .collect::<Result<Vec<_>>>()?,
             timestamp,
             tie,
         })
@@ -490,6 +604,7 @@ impl Plan {
     pub async fn catalog(
         &self,
         tx: &Transaction<'_>,
+        statements: &CatalogStatements,
         operation: &super::adapter::Operation,
     ) -> Result<Signature> {
         let mut columns = BTreeMap::new();
@@ -497,13 +612,7 @@ impl Plan {
         for relation in &self.relations {
             operation.check()?;
             let rows = tx
-                .query(
-                    "SELECT c.oid, c.relkind::text, c.relpersistence::text, c.relrowsecurity, \
-                 EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) \
-                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
-                 WHERE n.nspname=$1 AND c.relname=$2 LIMIT 2",
-                    &[&relation.schema, &relation.name],
-                )
+                .query(&statements.relation, &[&relation.schema, &relation.name])
                 .await
                 .map_err(database)?;
             operation.check()?;
@@ -518,47 +627,55 @@ impl Plan {
             {
                 return Err(Error::Metadata);
             }
-            for reference in self.referenced.iter().filter(|c| c.alias == relation.alias) {
+            let requested: BTreeSet<_> = self
+                .referenced
+                .iter()
+                .filter(|c| c.alias == relation.alias)
+                .map(|c| c.name.as_str())
+                .collect();
+            // The validated SQL bounds this array. Return one extra row so a
+            // catalog mismatch cannot hide behind truncation to the expected size.
+            let names: Vec<_> = requested.iter().copied().collect();
+            operation.check()?;
+            let rows = tx
+                .query(&statements.attributes, &[&oid, &names])
+                .await
+                .map_err(database)?;
+            operation.check()?;
+            if rows.len() != requested.len() {
+                return Err(Error::Metadata);
+            }
+            let mut remaining = requested;
+            for row in rows {
                 operation.check()?;
-                let rows = tx.query(
-                    "SELECT a.attnum,a.atttypid,a.atttypmod,a.attnotnull,a.attcollation,t.typcollation \
-                     FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid \
-                     WHERE a.attrelid=$1 AND a.attname=$2 AND a.attnum>0 AND NOT a.attisdropped LIMIT 2",
-                    &[&oid, &reference.name]).await.map_err(database)?;
-                operation.check()?;
-                let [row] = rows.as_slice() else {
+                let name: &str = row.try_get(0).map_err(database)?;
+                if !remaining.remove(name) {
                     return Err(Error::Metadata);
-                };
+                }
                 let col = NativeColumn {
                     oid,
-                    attribute: row.try_get(0).map_err(database)?,
-                    type_oid: row.try_get(1).map_err(database)?,
-                    modifier: row.try_get(2).map_err(database)?,
-                    not_null: row.try_get(3).map_err(database)?,
-                    collation: row.try_get(4).map_err(database)?,
+                    attribute: row.try_get(1).map_err(database)?,
+                    type_oid: row.try_get(2).map_err(database)?,
+                    modifier: row.try_get(3).map_err(database)?,
+                    not_null: row.try_get(4).map_err(database)?,
+                    collation: row.try_get(5).map_err(database)?,
                 };
                 let native = Type::from_oid(col.type_oid).ok_or(Error::Metadata)?;
                 let _ = super::value::native_type(native.name()).map_err(|_| Error::Metadata)?;
-                if col.collation != row.try_get::<_, u32>(5).map_err(database)? {
+                if col.collation != row.try_get::<_, u32>(6).map_err(database)? {
                     return Err(Error::Metadata);
                 }
-                let _ = columns.insert(reference.clone(), col);
+                let _ = columns.insert(
+                    ColumnRef {
+                        alias: relation.alias.clone(),
+                        name: name.to_owned(),
+                    },
+                    col,
+                );
             }
             operation.check()?;
             let rows = tx
-                .query(
-                    "SELECT i.indkey::smallint[], i.indnkeyatts, i.indexrelid FROM pg_catalog.pg_index i \
-                 WHERE i.indrelid=$1 AND i.indisunique AND i.indisvalid AND i.indisready \
-                 AND i.indimmediate AND i.indpred IS NULL AND i.indexprs IS NULL \
-                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(i.indclass::oid[]) k(oid) \
-                   JOIN pg_catalog.pg_opclass o ON o.oid=k.oid \
-                   JOIN pg_catalog.pg_namespace n ON n.oid=o.opcnamespace WHERE n.nspname<>'pg_catalog') \
-                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.generate_series(0,i.indnkeyatts-1) k(n) \
-                   JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[k.n] \
-                   WHERE i.indcollation[k.n]<>a.attcollation) \
-                 ORDER BY i.indexrelid LIMIT 129",
-                    &[&oid],
-                )
+                .query(&statements.indexes, &[&oid])
                 .await
                 .map_err(database)?;
             operation.check()?;

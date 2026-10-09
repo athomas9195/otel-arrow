@@ -800,7 +800,7 @@ where
                                     metrics.query_failures.add(1);
                                 }
                                 database_retry.failed::<A>(
-                                    error, "execute", &source_id, &effect_handler,
+                                    error, "execute", &source_id, &effect_handler, query.interval(),
                                 )?;
                                 admission.interrupt_cycle();
                                 encoder.release_scratch();
@@ -1024,9 +1024,26 @@ struct DatabaseRetry {
 impl DatabaseRetry {
     fn schedule(&mut self, now: Instant) -> Duration {
         let delay = self.backoff.next_delay();
+        self.schedule_after(now, delay)
+    }
+
+    fn schedule_after(&mut self, now: Instant, delay: Duration) -> Duration {
         self.retry_at = Some(now + delay);
         self.failures = self.failures.saturating_add(1);
         delay
+    }
+
+    fn schedule_error<A: DriverAdapter>(
+        &mut self,
+        now: Instant,
+        error: &A::Error,
+        interval: Duration,
+    ) -> Duration {
+        if A::retry_at_next_interval(error) {
+            self.schedule_after(now, interval)
+        } else {
+            self.schedule(now)
+        }
     }
 
     fn failed<A: DriverAdapter>(
@@ -1035,11 +1052,12 @@ impl DatabaseRetry {
         phase: &'static str,
         source_id: &str,
         effects: &local::EffectHandler<OtapPdata>,
+        interval: Duration,
     ) -> Result<(), Error> {
         if !A::is_retryable(&error) {
             return Err(receiver_error(effects, A::classify_error(&error), error));
         }
-        let delay = self.schedule(Instant::now());
+        let delay = self.schedule_error::<A>(Instant::now(), &error, interval);
         // Native errors can contain credentials or query values. Recovery logs
         // describe the phase and schedule without copying driver diagnostics.
         otel_warn!(
@@ -1143,7 +1161,7 @@ async fn prepare_database<A: DriverAdapter>(
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
-                retry.failed::<A>(error, "reconnect", source_id, effects)?;
+                retry.failed::<A>(error, "reconnect", source_id, effects, query.interval())?;
                 continue;
             }
             retry.retry_at = None;
@@ -1177,7 +1195,9 @@ async fn prepare_database<A: DriverAdapter>(
                 })?;
                 return Ok(OperationOutcome::Completed(columns));
             }
-            Err(error) => retry.failed::<A>(error, "validate", source_id, effects)?,
+            Err(error) => {
+                retry.failed::<A>(error, "validate", source_id, effects, query.interval())?
+            }
         }
     }
 }

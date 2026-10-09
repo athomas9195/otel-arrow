@@ -320,6 +320,11 @@ path = "examples/oracle_load_generator.rs"
 required-features = ["oracle"]
 
 [[example]]
+name = "postgresql_load_generator"
+path = "examples/postgresql_load_generator.rs"
+required-features = ["postgresql"]
+
+[[example]]
 name = "postgresql_e2e"
 path = "examples/postgresql_e2e.rs"
 required-features = ["postgresql"]

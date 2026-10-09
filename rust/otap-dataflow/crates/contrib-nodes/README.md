@@ -86,15 +86,15 @@ Exporters send data out of a pipeline.
 ## Feature Aggregates
 
 - `contrib-nodes`: enables contrib receivers, processors, and exporters, except
-  the explicitly opt-in Oracle receiver.
-- `contrib-receivers`: enables contrib receivers except Oracle.
+  the explicitly opt-in Oracle and PostgreSQL receivers.
+- `contrib-receivers`: enables contrib receivers except Oracle and PostgreSQL.
 - `contrib-processors`: enables all contrib processors.
 - `contrib-exporters`: enables all contrib exporters.
 - `kafka`: enables both the Kafka receiver and exporter.
 
-Enable `oracle` or `postgresql` explicitly to include those integrations. They are excluded from both
-`contrib-receivers` and `contrib-nodes` because Oracle Client libraries must be
-provisioned separately.
+Enable `oracle` or `postgresql` explicitly to include those integrations.
+Oracle requires separately provisioned Oracle Client libraries; PostgreSQL is
+development-only while its database transport remains unencrypted.
 
 When these features are enabled in the top-level binary, their factories are
 registered into the OTAP pipeline factory maps.

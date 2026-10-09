@@ -3,9 +3,262 @@
 
 // Private adapter tests remain colocated logically without exposing implementation internals.
 macro_rules! postgresql_module_tests {
+    (value) => {
+        mod tests {
+            use super::*;
+
+            /// Scenario: Native PostgreSQL timestamps cover years before the epoch, leap days, and microsecond boundaries.
+            /// Guarantees: Both native timestamp types emit exact ISO 8601 UTC text with six fractional digits and a Z suffix.
+            #[test]
+            fn direct_timestamp_format_matches_native_text_contract() {
+                for (year, month, day) in [
+                    (1, 1, 1),
+                    (1960, 2, 29),
+                    (2000, 1, 1),
+                    (2026, 12, 31),
+                    (9999, 12, 31),
+                ] {
+                    for micros in [0, 1, 1000, 123456, 999999] {
+                        let dt = NaiveDate::from_ymd_opt(year, month, day)
+                            .expect("date")
+                            .and_hms_micro_opt(23, 59, 59, micros)
+                            .expect("time");
+                        let bytes = dt
+                            .signed_duration_since(epoch().expect("epoch"))
+                            .num_microseconds()
+                            .expect("native range")
+                            .to_be_bytes();
+                        assert_eq!(
+                            decode(&Type::TIMESTAMP, &bytes).expect("timestamp"),
+                            CellValue::Timestamp(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+                        );
+                        assert_eq!(
+                            decode(&Type::TIMESTAMPTZ, &bytes).expect("timestamptz"),
+                            CellValue::TimestampTz(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+                        );
+                    }
+                }
+            }
+
+            /// Scenario: Sorted rows share timestamps or continuously advance to a new timestamp.
+            /// Guarantees: The single-entry cache preserves exact values and reuses fixed storage instead of growing with row count.
+            #[test]
+            fn timestamp_cache_is_exact_and_bounded() {
+                let mut cache = CursorTimestampCache::default();
+                let _ = cache.decode(&0i64.to_be_bytes(), 6).expect("initial");
+                let capacity = cache.text.capacity();
+                for micros in [-1i64, 0, 0, 1, 1, 123456, 1_000_000, 86_400_000_000] {
+                    let bytes = micros.to_be_bytes();
+                    let dt = timestamp(&bytes).expect("native timestamp");
+                    let (cached, text) = cache.decode(&bytes, 6).expect("decoded");
+                    assert_eq!(cached, dt);
+                    assert_eq!(text, dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string());
+                    assert_eq!(cache.text.capacity(), capacity);
+                }
+                let micros = 1i64.to_be_bytes();
+                assert!(cache.decode(&micros, 6).is_ok());
+                assert!(
+                    cache.decode(&micros, 3).is_err(),
+                    "precision is part of the cache key"
+                );
+                assert!(cache.decode(&i64::MAX.to_be_bytes(), 6).is_err());
+                assert!(cache.decode(&[0; 7], 6).is_err());
+                assert_eq!(
+                    cache.decode(&micros, 6).expect("valid").1,
+                    "2000-01-01T00:00:00.000001Z"
+                );
+            }
+
+            /// Scenario: A native cursor timestamp is checked without parsing its formatted string.
+            /// Guarantees: Typmod precision, invalid modifiers, and leap-second rejection match checkpoint parsing.
+            #[test]
+            fn native_cursor_validation_preserves_precision_checks() {
+                let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
+                for micros in [0, 1, 1000, 123000, 123001, 999999] {
+                    let dt = date.and_hms_micro_opt(0, 0, 0, micros).expect("time");
+                    for modifier in [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7] {
+                        assert_eq!(
+                            validate_timestamp(dt, modifier).is_ok(),
+                            cursor_time(&timestamp_text(dt).expect("formatted"), modifier).is_ok()
+                        );
+                    }
+                }
+                assert!(
+                    validate_timestamp(
+                        date.and_hms_nano_opt(23, 59, 59, 1_000_000_000)
+                            .expect("leap second"),
+                        6
+                    )
+                    .is_err()
+                );
+            }
+        }
+    };
+    (worker) => {
+        mod tests {
+            use super::*;
+
+            /// Scenario: Native cursor positions cross equal timestamps, integer boundaries, and timestamp transitions.
+            /// Guarantees: The allocation-free ordering check agrees with the shared durable-cursor comparison.
+            #[test]
+            fn native_cursor_order_matches_shared_order() {
+                use otel_arrow_dfe_scraper::database::Cursor;
+                let timestamp = convert::cursor_time("2026-01-01T00:00:00.123456Z", 6)
+                    .expect("timestamp")
+                    .naive_utc();
+                for (previous, next) in [
+                    ((timestamp, 1), (timestamp, 1)),
+                    ((timestamp, 1), (timestamp, 2)),
+                    ((timestamp, 0), (timestamp, -1)),
+                    ((timestamp, i64::MIN), (timestamp, i64::MAX)),
+                    (
+                        (timestamp, i64::MAX),
+                        (timestamp + chrono::Duration::microseconds(1), i64::MIN),
+                    ),
+                    (
+                        (timestamp, 1),
+                        (timestamp - chrono::Duration::microseconds(1), 2),
+                    ),
+                ] {
+                    let cursor = |position: convert::CursorPosition| {
+                        Cursor::composite(
+                            position.0.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+                            position.1,
+                        )
+                    };
+                    assert_eq!(
+                        ensure_advance(&previous, &next).is_ok(),
+                        cursor(next).compare(&cursor(previous)).expect("compatible")
+                            == std::cmp::Ordering::Greater
+                    );
+                }
+            }
+
+            /// Scenario: Row sizes change from narrow to wide while pages approach their byte ceiling.
+            /// Guarantees: The first fetch probes one row; subsequent fetches respect remaining bytes and the caller's configured row limit.
+            #[test]
+            fn fetch_size_adapts_to_observed_rows() {
+                let mut size = FetchSize::default();
+                let budget = 8 * 1024 * 1024;
+                assert_eq!(size.target(MAX_PAGE_ROWS, budget), 1);
+                size.observe(512);
+                assert_eq!(size.target(300, budget), 300);
+                assert_eq!(size.target(17, budget), 17);
+                assert_eq!(size.target(MAX_PAGE_ROWS, budget), MAX_PAGE_ROWS);
+                assert_eq!(size.target(12, budget), 12);
+                size.observe(900 * 1024);
+                assert_eq!(size.target(MAX_PAGE_ROWS, budget), 9);
+                assert_eq!(size.target(MAX_PAGE_ROWS, 900 * 1024 - 1), 0);
+                size.observe(1);
+                assert_eq!(size.target(MAX_PAGE_ROWS, budget), 9);
+                assert_eq!(size.target(0, budget), 0);
+            }
+
+            /// Scenario: Sixty-four valid 900-KiB rows span several 8-MiB pages.
+            /// Guarantees: Fetch estimates survive page boundaries without repeatedly requesting discarded rows.
+            #[test]
+            fn large_rows_do_not_repeat_full_fetches() {
+                let mut size = FetchSize::default();
+                let row_bytes = 900 * 1024;
+                let mut remaining = 64usize;
+                let mut requested = 0;
+                while remaining > 0 {
+                    let mut used = 128 * 1024;
+                    let mut page_rows = 0;
+                    loop {
+                        let count = size.target(
+                            (MAX_PAGE_ROWS - page_rows).min(remaining),
+                            8 * 1024 * 1024 - used,
+                        );
+                        if count == 0 {
+                            break;
+                        }
+                        requested += count;
+                        for _ in 0..count {
+                            size.observe(row_bytes);
+                            used += row_bytes;
+                            assert!(used <= 8 * 1024 * 1024);
+                            page_rows += 1;
+                            remaining -= 1;
+                        }
+                    }
+                    assert!(page_rows > 0);
+                }
+                assert_eq!(requested, 64);
+            }
+
+            /// Scenario: A connection-driving task panics before worker cleanup joins it.
+            /// Guarantees: Cleanup reports failure once, removes the session, and never polls the completed join handle again.
+            #[tokio::test]
+            async fn panicked_driver_cleanup_is_not_repolled() {
+                tokio::task::LocalSet::new()
+                    .run_until(async {
+                        let driver: JoinHandle<Result<()>> = tokio::task::spawn_local(async {
+                            panic!("injected driver failure");
+                        });
+                        let mut worker = Worker {
+                            validated: super::super::tests::test_validated(),
+                            session: Some(Session {
+                                client: None,
+                                driver,
+                                statement: None,
+                                catalog: None,
+                                receive_failure: ReceiveFailure::default(),
+                            }),
+                            signature: None,
+                            cancel: Rc::new(RefCell::new(None)),
+                            poisoned: false,
+                            principal: None,
+                            fetch_size: FetchSize::default(),
+                            timestamp_cache: convert::CursorTimestampCache::default(),
+                        };
+                        assert_eq!(worker.close().await, Err(Error::Cleanup));
+                        assert!(worker.session.is_none());
+                        assert!(worker.poisoned);
+                        assert_eq!(worker.close().await, Ok(()));
+                        assert!(
+                            worker.poisoned,
+                            "cleanup cannot clear the quarantined state"
+                        );
+                    })
+                    .await;
+            }
+        }
+    };
     () => {
         mod tests {
             use super::*;
+
+            /// Scenario: PostgreSQL reports overload, transaction conflicts, timeout, or permanent failures.
+            /// Guarantees: Transient SQLSTATEs retry, only timeouts wait an interval, and auth/schema errors stay terminal.
+            #[test]
+            fn sqlstate_retry_policy() {
+                for code in [
+                    "53300", "08006", "57P01", "57P02", "57P03", "40001", "40P01",
+                ] {
+                    let error = sqlstate(code);
+                    assert_eq!(error, Error::Unavailable);
+                    assert!(PostgreSqlAdapter::is_retryable(&error));
+                    assert!(!PostgreSqlAdapter::retry_at_next_interval(&error));
+                }
+                let timeout = sqlstate("57014");
+                assert_eq!(timeout, Error::Timeout);
+                assert!(PostgreSqlAdapter::is_retryable(&timeout));
+                assert!(PostgreSqlAdapter::retry_at_next_interval(&timeout));
+                for code in ["28P01", "42501", "42P01", "23505", "53200", "XX000"] {
+                    let error = sqlstate(code);
+                    assert_eq!(error, Error::Database);
+                    assert!(!PostgreSqlAdapter::is_retryable(&error));
+                }
+                for error in [
+                    Error::Limit,
+                    Error::Value,
+                    Error::Credential,
+                    Error::Cleanup,
+                ] {
+                    assert!(!PostgreSqlAdapter::is_retryable(&error));
+                }
+            }
 
             /// Scenario: A worker panics after acknowledging cleanup but before its thread exits.
             /// Guarantees: A failed join remains terminal across repeated shutdown calls.
@@ -63,17 +316,12 @@ macro_rules! postgresql_module_tests {
 }
 
 use super::{
-    adapter::Error,
-    adapter::Operation,
-    config::PostgreSqlReceiverConfig as Config,
-    query::compile_parameters,
-    transport::{Guard, GuardState},
-    value as convert,
+    adapter::Error, adapter::Operation, config::PostgreSqlReceiverConfig as Config,
+    query::compile_parameters, value as convert,
 };
 use otel_arrow_dfe_scraper::database::{CellValue, DatabaseSystem, DriverAdapter};
 use serde_json::{Value, json};
-use std::sync::{Arc, atomic::Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
 use tokio_postgres::types::Type;
 
 struct FixedCredentials;
@@ -141,6 +389,10 @@ fn sql(predicate: &str) -> String {
 }
 fn validate(value: &Value) -> super::adapter::Result<super::config::Validated> {
     Config::parse(value)?.validate()
+}
+
+pub(super) fn test_validated() -> super::config::Validated {
+    validate(&config(&sql(KEY))).expect("worker fixture")
 }
 
 /// Scenario: Both vendor identities are emitted by the existing shared mapper.
@@ -215,6 +467,157 @@ fn supported_sql_shapes() {
     assert!(validate(&config(&joined)).is_ok());
 }
 
+/// Scenario: Exact OR keysets occur alone, in parentheses, among filters, and with an inner join.
+/// Guarantees: Only the keyset AST becomes a tuple comparison; all other SQL and the page limit match.
+#[test]
+fn keyset_optimization_preserves_query_tree() {
+    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+    let tuple = "((e.ts, e.id) > (:last_timestamp, :last_tie_breaker))";
+    for predicate in [
+        KEY.to_owned(),
+        format!("(({KEY}))"),
+        format!("e.id >= -10 AND {KEY}"),
+        format!("{KEY} AND e.id IS NOT NULL"),
+        format!("e.id >= -10 AND (({KEY})) AND e.id < 42"),
+        format!("{KEY} AND e.note = 'caf\u{e9} :last_timestamp it''s $2'"),
+    ] {
+        for joined in [false, true] {
+            let mut source = sql(&predicate);
+            if joined {
+                source = source.replace(
+                    "public.events AS e",
+                    "public.events AS e INNER JOIN public.lookup AS l ON e.id = l.id",
+                );
+            }
+            let expected_source = source.replace(KEY, tuple);
+            let original = validate(&config(&source)).expect("OR query");
+            let native = validate(&config(&expected_source)).expect("tuple query");
+            let expected = format!(
+                "{} LIMIT {}",
+                compile_parameters(&expected_source, "last_timestamp", "last_tie_breaker")
+                    .expect("parameters"),
+                super::query::MAX_PAGE_ROWS
+            );
+            let parse =
+                |text: &str| Parser::parse_sql(&PostgreSqlDialect {}, text).expect("query tree");
+            assert_eq!(parse(&original.plan.sql), parse(&expected), "{source}");
+            assert_eq!(parse(&original.plan.sql), parse(&native.plan.sql));
+            assert_eq!(original.common.sql(), source);
+            assert_eq!(original.plan.referenced, native.plan.referenced);
+            assert_eq!(original.plan.filters, native.plan.filters);
+        }
+    }
+}
+
+/// Scenario: Quoted aliases, cursor columns, and UTF-8 or escaped strings surround a nested OR keyset.
+/// Guarantees: AST rewriting retains identifier spelling, literal values, projections, filters, and order.
+#[test]
+fn keyset_optimization_preserves_quoted_identifiers() {
+    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+    let source = concat!(
+        "SELECT \"Event\".\"Ts\" AS ts, \"Event\".\"Id\" AS id ",
+        "FROM \"public\".\"Events\" AS \"Event\" ",
+        "WHERE \"Event\".\"Note\" = 'it''s :last_timestamp' AND ",
+        "(((\"Event\".\"Ts\") > (:last_timestamp)) OR ",
+        "(((\"Event\".\"Ts\") = (:last_timestamp)) AND ",
+        "((\"Event\".\"Id\") > (:last_tie_breaker)))) ",
+        "AND \"Event\".\"Other\" = '"
+    );
+    let source = format!("{source}\u{e9} $2' ORDER BY \"Event\".\"Ts\" ASC, \"Event\".\"Id\"");
+    let optimized = validate(&config(&source)).expect("quoted query");
+    let expected = format!(
+        "SELECT \"Event\".\"Ts\" AS ts, \"Event\".\"Id\" AS id \
+         FROM \"public\".\"Events\" AS \"Event\" \
+         WHERE \"Event\".\"Note\" = 'it''s :last_timestamp' AND \
+         ((\"Event\".\"Ts\", \"Event\".\"Id\") > ($1, $2)) \
+         AND \"Event\".\"Other\" = '\u{e9} $2' \
+         ORDER BY \"Event\".\"Ts\" ASC, \"Event\".\"Id\" LIMIT {}",
+        super::query::MAX_PAGE_ROWS
+    );
+    assert_eq!(
+        Parser::parse_sql(&PostgreSqlDialect {}, &optimized.plan.sql).expect("optimized"),
+        Parser::parse_sql(&PostgreSqlDialect {}, &expected).expect("expected")
+    );
+    assert_eq!(optimized.common.sql(), source);
+}
+
+/// Scenario: Different authored keysets compile to the same bounded tuple query.
+/// Guarantees: Checkpoint identity still hashes the original SQL and existing version identifiers.
+#[test]
+fn optimized_query_retains_original_checkpoint_identity() {
+    let source = sql(KEY);
+    let validated = validate(&config(&source)).expect("original");
+    let cfg = &validated.config;
+    let identity = serde_json::to_vec(&(
+        "postgresql/v3",
+        "postgresql",
+        &cfg.connection.host,
+        cfg.connection.port,
+        &cfg.connection.database,
+        &source,
+        "named-parameters/v2",
+        &cfg.watermark,
+        &cfg.query.output,
+        &cfg.query.result_schema,
+        "UTC/microseconds/native-v2",
+    ))
+    .expect("identity");
+    assert_eq!(
+        validated.fingerprint,
+        blake3::hash(&identity).to_hex().to_string()
+    );
+    let tuple = validate(&config(&sql(
+        "((e.ts, e.id) > (:last_timestamp, :last_tie_breaker))",
+    )))
+    .expect("tuple");
+    assert_eq!(validated.plan.sql, tuple.plan.sql);
+    assert_ne!(validated.fingerprint, tuple.fingerprint);
+}
+
+/// Scenario: A bounded query projects 128 columns with additional filter and join references.
+/// Guarantees: Catalog requests can deduplicate each relation's complete metadata without losing provenance.
+#[test]
+fn wide_query_tracks_all_catalog_references() {
+    let projection = std::iter::once("e.ts".to_owned())
+        .chain(std::iter::once("e.id".to_owned()))
+        .chain((0..126).map(|i| format!("e.c{i}")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "SELECT {projection} FROM public.events AS e \
+         INNER JOIN public.lookup AS l ON e.id = l.id \
+         WHERE {KEY} AND e.c0 > 0 AND e.extra IS NOT NULL AND l.enabled = TRUE \
+         ORDER BY e.ts, e.id"
+    );
+    let mut cfg = config(&source);
+    let schema = cfg["query"]["result_schema"]
+        .as_array_mut()
+        .expect("schema");
+    for i in 0..126 {
+        schema.push(json!({
+            "name": format!("c{i}"), "source_type": "int8",
+            "nullable": true, "type_modifier": -1
+        }));
+    }
+    let plan = validate(&cfg).expect("wide query").plan;
+    assert_eq!(plan.projections.len(), 128);
+    assert_eq!(plan.referenced.len(), 131);
+    for (alias, expected) in [("e", 129), ("l", 2)] {
+        assert_eq!(
+            plan.referenced.iter().filter(|c| c.alias == alias).count(),
+            expected
+        );
+    }
+    assert_eq!(plan.relations[1].join[0].0.alias, "e");
+    assert_eq!(plan.relations[1].join[0].1.alias, "l");
+    assert!(
+        plan.sql
+            .ends_with(&format!(" LIMIT {}", super::query::MAX_PAGE_ROWS))
+    );
+}
+
 /// Scenario: Legal SQL outside the experiment or an OR-bypass weakens the keyset contract.
 /// Guarantees: Rejected statements never reach native prepare, including all extra query/select clauses.
 #[test]
@@ -223,6 +626,12 @@ fn unsafe_and_unsupported_sql_rejected() {
     for text in [
         sql(&format!("{KEY} OR TRUE")),
         sql(&format!("{KEY} AND ({KEY})")),
+        sql(&format!(
+            "{KEY} AND (e.ts, e.id) > (:last_timestamp, :last_tie_breaker)"
+        )),
+        sql("e.ts >= :last_timestamp OR (e.ts = :last_timestamp AND e.id > :last_tie_breaker)"),
+        sql("e.ts > :last_timestamp OR (e.ts = :last_timestamp AND e.id >= :last_tie_breaker)"),
+        sql("e.ts > :last_timestamp OR (e.id > :last_tie_breaker AND e.ts = :last_timestamp)"),
         sql("e.ts > :last_timestamp AND e.id > :last_tie_breaker"),
         base.replace("e.ts, e.id FROM", "e.ts, abs(e.id) AS id FROM"),
         base.replace("SELECT", "SELECT DISTINCT"),
@@ -237,6 +646,7 @@ fn unsafe_and_unsupported_sql_rejected() {
         base.replace("ORDER BY e.ts, e.id", "ORDER BY e.ts DESC, e.id"),
         base.replace("ORDER BY e.ts, e.id", "ORDER BY e.ts NULLS FIRST, e.id"),
         format!("{base} LIMIT 1"),
+        format!("{base} LIMIT {}", super::query::MAX_PAGE_ROWS),
         format!("{base} OFFSET 1"),
         format!("{base} FETCH FIRST 1 ROW ONLY"),
         format!("{base} FOR UPDATE"),
@@ -298,6 +708,242 @@ fn interval_boundaries() {
         let mut cfg = config(&sql(KEY));
         cfg["query"]["interval"] = json!(interval);
         assert_eq!(validate(&cfg).is_ok(), allowed, "{interval}");
+    }
+}
+
+/// Scenario: PostgreSQL omits catch-up settings or overrides either shared budget.
+/// Guarantees: Oracle's 32-page/10-second defaults apply; overrides preserve checkpoints and per-page resource bounds.
+#[test]
+fn catch_up_matches_oracle_defaults_and_overrides() {
+    let base = config(&sql(KEY));
+    let fingerprint = validate(&base).expect("default config").fingerprint;
+    for (override_value, pages, millis) in [
+        (None, 32, 10_000),
+        (Some(json!({"max_pages": 2})), 2, 10_000),
+        (Some(json!({"max_duration": "50ms"})), 32, 50),
+        (
+            Some(json!({"max_pages": 1024, "max_duration": "5m"})),
+            1024,
+            300_000,
+        ),
+    ] {
+        let mut value = base.clone();
+        if let Some(override_value) = override_value {
+            value["query"]["catch_up"] = override_value;
+        }
+        let validated = validate(&value).expect("valid catch-up");
+        assert_eq!(validated.fingerprint, fingerprint);
+        let query = validated.common;
+        assert_eq!(query.catch_up().max_pages, pages);
+        assert_eq!(
+            query.catch_up().max_duration,
+            std::time::Duration::from_millis(millis)
+        );
+        assert_eq!(query.fetch_size_rows(), 300);
+        assert_eq!(query.max_rows(), 1000);
+        assert_eq!(query.max_batch_bytes(), 8 * 1024 * 1024);
+        assert_eq!(query.max_normalized_bytes(), 8 * 1024 * 1024);
+    }
+}
+
+/// Scenario: PostgreSQL supplies catch-up values outside Oracle's shared limits or adds unknown fields.
+/// Guarantees: Invalid budgets are rejected instead of disabling limits or silently falling back.
+#[test]
+fn invalid_catch_up_settings_are_rejected() {
+    for catch_up in [
+        json!({"max_pages": 0}),
+        json!({"max_pages": 1025}),
+        json!({"max_duration": "0ms"}),
+        json!({"max_duration": "5m1ms"}),
+        json!({"unlimited": true}),
+        Value::Null,
+    ] {
+        let mut value = config(&sql(KEY));
+        value["query"]["catch_up"] = catch_up;
+        assert!(validate(&value).is_err());
+    }
+}
+
+/// Scenario: PostgreSQL omits or overrides the Oracle-style fetch-size setting.
+/// Guarantees: The default remains 300, valid overrides reach the compiled query, and changing fetch size preserves checkpoint identity.
+#[test]
+fn fetch_size_defaults_and_overrides() {
+    let base = config(&sql(KEY));
+    let default = validate(&base).expect("default");
+    assert_eq!(default.common.fetch_size_rows(), 300);
+    for rows in [1, 17, 300, 1000] {
+        let mut value = base.clone();
+        value["query"]["fetch_size_rows"] = json!(rows);
+        let configured = validate(&value).expect("configured fetch size");
+        assert_eq!(configured.common.fetch_size_rows(), rows);
+        assert_eq!(configured.fingerprint, default.fingerprint);
+    }
+}
+
+/// Scenario: Fetch size is zero, exceeds the fixed page size, or has an invalid type.
+/// Guarantees: Invalid values fail explicitly rather than being clamped or silently replaced with a default.
+#[test]
+fn invalid_fetch_sizes_are_rejected() {
+    for rows in [
+        json!(0),
+        json!(1001),
+        json!(10000),
+        json!(-1),
+        json!(1.5),
+        json!("300"),
+        Value::Null,
+    ] {
+        let mut value = config(&sql(KEY));
+        value["query"]["fetch_size_rows"] = rows;
+        assert!(validate(&value).is_err());
+    }
+}
+
+/// Scenario: An optional event timestamp is NULL or outside OTLP's unsigned nanosecond range.
+/// Guarantees: PostgreSQL values reach the shared mapper unchanged and use observation time without changing the cursor.
+#[test]
+fn optional_event_time_uses_shared_fallback() {
+    use otel_arrow_dfe_pdata::{
+        PayloadData,
+        otlp::OtlpProtoBytes,
+        proto::opentelemetry::{common::v1::any_value, logs::v1::LogsData},
+    };
+    use otel_arrow_dfe_scraper::database::{
+        ColumnMetadata, Cursor, CursorRow, OutputConfig, QueryPage, Row, encode_page,
+    };
+    use prost::Message;
+    let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .expect("epoch")
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight");
+    let mut values = vec![CellValue::Null];
+    for year in [1960, 3000] {
+        let time = chrono::NaiveDate::from_ymd_opt(year, 1, 1)
+            .expect("date")
+            .and_hms_opt(0, 0, 0)
+            .expect("time");
+        let bytes = time
+            .signed_duration_since(epoch)
+            .num_microseconds()
+            .expect("micros")
+            .to_be_bytes();
+        values.push(convert::decode(&Type::TIMESTAMPTZ, &bytes).expect("native timestamp"));
+    }
+    for value in values {
+        let is_null = matches!(value, CellValue::Null);
+        let expected = match &value {
+            CellValue::Null => None,
+            CellValue::TimestampTz(text) => Some(any_value::Value::StringValue(text.clone())),
+            _ => panic!("timestamp fixture"),
+        };
+        let cursor = Cursor::composite("2026-10-05T00:00:00Z".into(), 1);
+        let encoded = encode_page(
+            QueryPage {
+                columns: vec![ColumnMetadata {
+                    name: "occurred".into(),
+                    source_type: "timestamptz".into(),
+                    nullable: true,
+                }],
+                rows: vec![CursorRow {
+                    row: Row {
+                        values: vec![value],
+                    },
+                    cursor: cursor.clone(),
+                }],
+            },
+            DatabaseSystem::PostgreSQL,
+            "fixture",
+            &OutputConfig {
+                timestamp_column: Some("occurred".into()),
+                validation_columns: vec![],
+            },
+            123,
+            1024,
+        )
+        .expect("mapping")
+        .expect("one row");
+        assert_eq!(encoded.row_count, 1);
+        assert_eq!(encoded.candidate, cursor);
+        assert_eq!(encoded.event_time_fallbacks, usize::from(!is_null));
+        let PayloadData::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(bytes)) =
+            encoded.pdata.payload().into_data()
+        else {
+            panic!("OTLP logs");
+        };
+        let logs = LogsData::decode(bytes).expect("logs");
+        let record = &logs.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(record.time_unix_nano, 123);
+        let Some(any_value::Value::KvlistValue(body)) =
+            record.body.as_ref().and_then(|body| body.value.as_ref())
+        else {
+            panic!("structured row");
+        };
+        assert_eq!(
+            body.values[0]
+                .value
+                .as_ref()
+                .and_then(|value| value.value.clone()),
+            expected
+        );
+    }
+}
+
+/// Scenario: A PostgreSQL cursor is configured using UTC ISO 8601 text or another timestamp notation.
+/// Guarantees: Only the T/Z form is accepted, with exact native precision rather than offset conversion or truncation.
+#[test]
+fn cursor_configuration_requires_iso_utc() {
+    for (initial, valid) in [
+        ("2026-01-01T00:00:00Z", true),
+        ("2026-01-01T00:00:00.123456Z", true),
+        ("2026-01-01T00:00:00.123456000Z", true),
+        ("2026-01-01 00:00:00", false),
+        ("2026-01-01 00:00:00Z", false),
+        ("2026-01-01T00:00:00+00:00", false),
+        ("2026-01-01T05:30:00+05:30", false),
+        ("2026-01-01T00:00:00", false),
+        ("2026-01-01", false),
+        ("2026-01-01T00:00:00.123456789Z", false),
+    ] {
+        let mut value = config(&sql(KEY));
+        value["watermark"]["timestamp"]["initial"] = json!(initial);
+        assert_eq!(validate(&value).is_ok(), valid, "{initial}");
+    }
+}
+
+/// Scenario: PostgreSQL's shipped console and OTLP pipelines obtain both credentials through the shared provider.
+/// Guarantees: Both examples reference username/password files and preserve the required capability binding.
+#[test]
+fn examples_use_shared_file_credentials() {
+    for (source, pipeline) in [
+        (
+            include_str!("../../../../../configs/postgresql-console.yaml"),
+            "/groups/default/pipelines/main",
+        ),
+        (
+            include_str!("../../../../../configs/postgresql-otlp.yaml"),
+            "/groups/database/pipelines/pg_fixture",
+        ),
+    ] {
+        let value: Value = serde_yaml::from_str(source).expect("example YAML");
+        let pipeline = value.pointer(pipeline).expect("pipeline");
+        let provider = &pipeline["extensions"]["pg-credentials"];
+        assert_eq!(
+            provider["type"],
+            "urn:otel:extension:flat_file_user_pass_auth"
+        );
+        assert!(provider["config"].get("username").is_none());
+        assert_eq!(
+            provider["config"]["username_file"],
+            "${env:PG_USERNAME_FILE:-/run/secrets/postgresql/username}"
+        );
+        assert_eq!(
+            provider["config"]["password_secret_file"],
+            "${env:PG_PASSWORD_FILE:-/run/secrets/postgresql/password}"
+        );
+        assert_eq!(
+            pipeline["nodes"]["pg"]["capabilities"]["basic_auth_provider"],
+            "pg-credentials"
+        );
     }
 }
 
@@ -489,121 +1135,6 @@ fn exact_values() {
     }
 }
 
-/// Scenario: Backend length headers advertise invalid and over-budget message sizes.
-/// Guarantees: The guard reads only its fixed header and exposes no bytes before rejecting.
-#[tokio::test]
-async fn frame_limit_before_exposure() {
-    for length in [-1i32, 0, 3, 1024 * 1024 + 1] {
-        let header = [vec![b'D'], length.to_be_bytes().to_vec()].concat();
-        let state = Arc::new(GuardState::default());
-        let mut guard = Guard::new(header.as_slice(), state.clone());
-        let mut buf = [0u8; 64];
-        assert!(guard.read(&mut buf).await.is_err());
-        assert_eq!(buf, [0; 64]);
-        assert!(state.limit.load(Ordering::Acquire));
-    }
-}
-
-/// Scenario: Headers/bodies arrive one byte at a time and consumers request tiny buffers.
-/// Guarantees: Valid frames remain byte-exact and truncated headers/bodies fail explicitly.
-#[tokio::test]
-async fn fragmented_frames_and_eof() {
-    let expected = [
-        vec![b'D'],
-        8i32.to_be_bytes().to_vec(),
-        vec![1, 2, 3, 4],
-        vec![b'Z'],
-        5i32.to_be_bytes().to_vec(),
-        vec![b'I'],
-    ]
-    .concat();
-    let (mut sender, receiver) = tokio::io::duplex(8);
-    let sent = expected.clone();
-    let task = tokio::spawn(async move {
-        for byte in sent {
-            sender.write_all(&[byte]).await.expect("write");
-        }
-    });
-    let mut guard = Guard::new(receiver, Arc::new(GuardState::default()));
-    let mut actual = vec![];
-    let mut buf = [0; 2];
-    loop {
-        let n = guard.read(&mut buf).await.expect("read");
-        if n == 0 {
-            break;
-        }
-        actual.extend_from_slice(&buf[..n]);
-    }
-    task.await.expect("writer");
-    assert_eq!(actual, expected);
-    for bytes in [&expected[..3], &expected[..8]] {
-        let mut guard = Guard::new(bytes, Arc::new(GuardState::default()));
-        assert!(guard.read_to_end(&mut vec![]).await.is_err());
-    }
-}
-
-/// Scenario: A certified server sends unlimited startup state, idle notices, or excessive column metadata.
-/// Guarantees: Side-channel traffic cannot bypass message and metadata bounds.
-#[tokio::test]
-async fn metadata_and_side_channels() {
-    for input in [
-        [
-            vec![b'T'],
-            6i32.to_be_bytes().to_vec(),
-            129u16.to_be_bytes().to_vec(),
-        ]
-        .concat(),
-        [vec![b'N'], 4i32.to_be_bytes().to_vec()].concat(),
-        [vec![b'S'], 4i32.to_be_bytes().to_vec()]
-            .concat()
-            .repeat(65),
-    ] {
-        let mut guard = Guard::new(input.as_slice(), Arc::new(GuardState::default()));
-        assert!(guard.read_to_end(&mut vec![]).await.is_err());
-    }
-}
-
-/// Scenario: Startup status traffic reaches its bound, then a server sends a status change after ReadyForQuery.
-/// Guarantees: The startup allowance cannot authorize unsolicited idle state changes or expose their headers.
-#[tokio::test]
-async fn startup_status_is_not_an_idle_allowance() {
-    let status = [vec![b'S'], 4i32.to_be_bytes().to_vec()].concat();
-    let ready = [vec![b'Z'], 5i32.to_be_bytes().to_vec(), vec![b'I']].concat();
-    let prefix = [status.repeat(64), ready].concat();
-    let input = [prefix.clone(), status].concat();
-    let state = Arc::new(GuardState::default());
-    let mut guard = Guard::new(input.as_slice(), state.clone());
-    let mut received = vec![0; prefix.len()];
-    let _ = guard
-        .read_exact(&mut received)
-        .await
-        .expect("bounded startup");
-    assert_eq!(received, prefix);
-    let mut rejected = [0; 5];
-    assert!(guard.read(&mut rejected).await.is_err());
-    assert_eq!(rejected, [0; 5]);
-    assert!(state.limit.load(Ordering::Acquire));
-}
-
-/// Scenario: An active operation receives exactly 128 notices followed by a 129th.
-/// Guarantees: The fixed per-operation notice allowance is enforced before the excess frame is exposed.
-#[tokio::test]
-async fn active_notice_bound() {
-    let notice = [vec![b'N'], 4i32.to_be_bytes().to_vec()].concat();
-    let input = notice.repeat(129);
-    let state = Arc::new(GuardState::default());
-    state.active.store(true, Ordering::Release);
-    let mut guard = Guard::new(input.as_slice(), state.clone());
-    let mut prefix = vec![0; notice.len() * 128];
-    let _ = guard
-        .read_exact(&mut prefix)
-        .await
-        .expect("notice allowance");
-    assert_eq!(prefix, notice.repeat(128));
-    assert!(guard.read(&mut [0; 5]).await.is_err());
-    assert!(state.limit.load(Ordering::Acquire));
-}
-
 /// Scenario: Cancellation is requested before a connection or client token exists.
 /// Guarantees: The operation generation is independently cancellable and later work observes it.
 #[test]
@@ -632,6 +1163,7 @@ fn redacted_errors() {
         Error::Database,
         Error::Unavailable,
         Error::Cancelled,
+        Error::Timeout,
         Error::Cleanup,
     ] {
         assert!(error.to_string().len() < 100);
@@ -728,16 +1260,22 @@ struct FailedCredentials;
 impl otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAuthProvider
     for FailedCredentials
 {
-    async fn get_credential(&self) -> Result<
+    async fn get_credential(
+        &self,
+    ) -> Result<
         otel_arrow_dfe_engine::capability::auth::BasicAuthCredential,
         otel_arrow_dfe_engine::capability::CapabilityError,
     > {
         Err(otel_arrow_dfe_engine::capability::CapabilityErrorSource::<
             otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthProvider,
-        >::new("PRIVATE_PROVIDER".into()).error("PRIVATE_PASSWORD"))
+        >::new("PRIVATE_PROVIDER".into())
+        .error("PRIVATE_PASSWORD"))
     }
 
-    fn credential_stream(&self) -> otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthCredentialStream {
+    fn credential_stream(
+        &self,
+    ) -> otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthCredentialStream
+    {
         Box::pin(futures::stream::pending())
     }
 }
@@ -749,9 +1287,14 @@ async fn provider_errors_are_redacted() {
     use std::error::Error as _;
     let validated = validate(&config(&sql(KEY))).expect("config");
     let query = validated.common.clone();
-    let mut adapter = super::adapter::PostgreSqlAdapter::new(validated, Box::new(FailedCredentials)).expect("worker");
+    let mut adapter =
+        super::adapter::PostgreSqlAdapter::new(validated, Box::new(FailedCredentials))
+            .expect("worker");
     _ = adapter.begin_operation().expect("operation");
-    let error = adapter.validate_query(&query).await.expect_err("credential error");
+    let error = adapter
+        .validate_query(&query)
+        .await
+        .expect_err("credential error");
     assert_eq!(error, Error::Credential);
     assert!(!super::adapter::PostgreSqlAdapter::is_retryable(&error));
     assert!(error.source().is_none());

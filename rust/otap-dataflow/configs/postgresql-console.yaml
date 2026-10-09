@@ -15,7 +15,7 @@ groups:
           pg-credentials:
             type: urn:otel:extension:flat_file_user_pass_auth
             config:
-              username: collector
+              username_file: '${env:PG_USERNAME_FILE:-/run/secrets/postgresql/username}'
               password_secret_file: '${env:PG_PASSWORD_FILE:-/run/secrets/postgresql/password}'
               password_secret_file_refresh: 1m
         nodes:
@@ -42,6 +42,10 @@ groups:
                   )
                   ORDER BY e.event_ts ASC, e.event_id ASC
                 interval: 1m
+                fetch_size_rows: 300
+                catch_up:
+                  max_pages: 32
+                  max_duration: 10s
                 result_schema:
                   - {name: event_ts, source_type: timestamptz, nullable: false, type_modifier: 6}
                   - {name: event_id, source_type: int8, nullable: false, type_modifier: -1}

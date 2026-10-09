@@ -5,7 +5,7 @@
 
 use super::{
     adapter::{Error, Result},
-    query::Plan,
+    query::{MAX_PAGE_ROWS, Plan},
 };
 use otel_arrow_dfe_scraper::database::{
     CatchUpConfig, CheckpointConfig, CompiledQuery, OnNack, OnPermanentNack, OutputConfig,
@@ -13,6 +13,9 @@ use otel_arrow_dfe_scraper::database::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::IpAddr, time::Duration};
+
+pub(super) const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +31,7 @@ pub(crate) struct PostgreSqlReceiverConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Connection {
     pub host: String,
-    #[serde(default = "port")]
+    #[serde(default = "default_port")]
     pub port: u16,
     pub database: String,
 }
@@ -37,8 +40,12 @@ pub(crate) struct Connection {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Query {
     pub statement: String,
-    #[serde(default = "interval", with = "humantime_serde")]
+    #[serde(default = "default_interval", with = "humantime_serde")]
     pub interval: Duration,
+    #[serde(default = "default_fetch_size_rows")]
+    pub fetch_size_rows: usize,
+    #[serde(default)]
+    pub catch_up: CatchUpConfig,
     pub result_schema: Vec<ExpectedColumn>,
     #[serde(default)]
     pub output: Output,
@@ -65,7 +72,7 @@ pub(crate) enum Watermark {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Timestamp {
     pub column: String,
-    #[serde(default = "timestamp_bind")]
+    #[serde(default = "default_timestamp_bind")]
     pub bind: String,
     pub initial: String,
     pub timezone: String,
@@ -74,7 +81,7 @@ pub(crate) struct Timestamp {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tie {
     pub column: String,
-    #[serde(default = "tie_bind")]
+    #[serde(default = "default_tie_breaker_bind")]
     pub bind: String,
     pub initial: i64,
 }
@@ -88,35 +95,39 @@ pub(crate) struct Output {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Checkpoint {
     pub directory: String,
-    #[serde(default = "rewind")]
+    #[serde(default = "default_on_nack")]
     pub on_nack: OnNack,
     #[serde(default)]
     pub on_permanent_nack: OnPermanentNack,
-    #[serde(default = "backoff", with = "humantime_serde")]
+    #[serde(default = "default_nack_backoff", with = "humantime_serde")]
     pub nack_backoff: Duration,
-    #[serde(default = "failures")]
+    #[serde(default = "default_max_consecutive_failures")]
     pub max_consecutive_failures: u32,
 }
 
-fn port() -> u16 {
+const fn default_port() -> u16 {
     5432
 }
-fn interval() -> Duration {
+const fn default_interval() -> Duration {
     Duration::from_secs(60)
 }
-fn backoff() -> Duration {
+const fn default_fetch_size_rows() -> usize {
+    300
+}
+
+const fn default_nack_backoff() -> Duration {
     Duration::from_secs(1)
 }
-fn failures() -> u32 {
+const fn default_max_consecutive_failures() -> u32 {
     5
 }
-fn rewind() -> OnNack {
+const fn default_on_nack() -> OnNack {
     OnNack::Rewind
 }
-fn timestamp_bind() -> String {
+fn default_timestamp_bind() -> String {
     "last_timestamp".into()
 }
-fn tie_bind() -> String {
+fn default_tie_breaker_bind() -> String {
     "last_tie_breaker".into()
 }
 
@@ -127,7 +138,7 @@ pub(crate) struct Validated {
     pub fingerprint: String,
 }
 
-pub(crate) fn name(value: &str, maximum: usize) -> Result<()> {
+pub(crate) fn validate_name(value: &str, maximum: usize) -> Result<()> {
     if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
         return Err(Error::Config);
     }
@@ -151,16 +162,16 @@ impl PostgreSqlReceiverConfig {
     }
 
     pub fn validate(mut self) -> Result<Validated> {
-        name(&self.source_id, 128)?;
-        name(&self.connection.database, 63)?;
-        let conn = &mut self.connection;
-        name(&conn.host, 253)?;
-        if conn.port == 0 {
+        validate_name(&self.source_id, 128)?;
+        validate_name(&self.connection.database, 63)?;
+        let connection = &mut self.connection;
+        validate_name(&connection.host, 253)?;
+        if connection.port == 0 {
             return Err(Error::Config);
         }
-        if conn.host.parse::<IpAddr>().is_err() {
-            if !conn.host.is_ascii()
-                || conn.host.split('.').any(|label| {
+        if connection.host.parse::<IpAddr>().is_err() {
+            if !connection.host.is_ascii()
+                || connection.host.split('.').any(|label| {
                     label.is_empty()
                         || label.len() > 63
                         || label.starts_with('-')
@@ -172,18 +183,18 @@ impl PostgreSqlReceiverConfig {
             {
                 return Err(Error::Config);
             }
-            conn.host.make_ascii_lowercase();
+            connection.host.make_ascii_lowercase();
         }
-        let q = &self.query;
-        if !(60..=86400).contains(&q.interval.as_secs()) || q.interval.subsec_nanos() != 0 {
+        let query = &self.query;
+        if !(60..=86400).contains(&query.interval.as_secs()) || query.interval.subsec_nanos() != 0 {
             return Err(Error::Config);
         }
-        if q.result_schema.is_empty() || q.result_schema.len() > 128 {
+        if query.result_schema.is_empty() || query.result_schema.len() > 128 {
             return Err(Error::Config);
         }
         let mut names = HashSet::new();
-        for column in &q.result_schema {
-            name(&column.name, 63)?;
+        for column in &query.result_schema {
+            validate_name(&column.name, 63)?;
             if !names.insert(column.name.to_ascii_lowercase()) || column.type_modifier < -1 {
                 return Err(Error::Config);
             }
@@ -193,37 +204,47 @@ impl PostgreSqlReceiverConfig {
             timestamp,
             tie_breaker,
         } = &self.watermark;
-        name(&timestamp.column, 63)?;
-        name(&tie_breaker.column, 63)?;
+        validate_name(&timestamp.column, 63)?;
+        validate_name(&tie_breaker.column, 63)?;
         if timestamp.timezone != "UTC" || !timestamp.initial.ends_with('Z') {
             return Err(Error::Config);
         }
-        let find = |name: &str| {
-            q.result_schema
+        let column_index = |name: &str| {
+            query
+                .result_schema
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(name))
                 .ok_or(Error::Config)
         };
-        let ts = find(&timestamp.column)?;
-        let tie = find(&tie_breaker.column)?;
-        if ts == tie || q.result_schema[ts].nullable || q.result_schema[tie].nullable {
-            return Err(Error::Config);
-        }
-        let ts_type = &q.result_schema[ts];
-        if !matches!(ts_type.source_type.as_str(), "timestamp" | "timestamptz")
-            || !matches!(
-                q.result_schema[tie].source_type.as_str(),
-                "int2" | "int4" | "int8"
-            )
+        let timestamp_index = column_index(&timestamp.column)?;
+        let tie_breaker_index = column_index(&tie_breaker.column)?;
+        if timestamp_index == tie_breaker_index
+            || query.result_schema[timestamp_index].nullable
+            || query.result_schema[tie_breaker_index].nullable
         {
             return Err(Error::Config);
         }
-        let _ = super::value::cursor_time(&timestamp.initial, ts_type.type_modifier)?;
-        super::value::check_tie(tie_breaker.initial, &q.result_schema[tie].source_type)?;
-        if let Some(output) = &q.output.timestamp_column {
-            name(output, 63)?;
+        let timestamp_column = &query.result_schema[timestamp_index];
+        if !matches!(
+            timestamp_column.source_type.as_str(),
+            "timestamp" | "timestamptz"
+        ) || !matches!(
+            query.result_schema[tie_breaker_index].source_type.as_str(),
+            "int2" | "int4" | "int8"
+        ) {
+            return Err(Error::Config);
+        }
+        let _ = super::value::cursor_time(&timestamp.initial, timestamp_column.type_modifier)?;
+        super::value::check_tie(
+            tie_breaker.initial,
+            &query.result_schema[tie_breaker_index].source_type,
+        )?;
+        if let Some(output) = &query.output.timestamp_column {
+            validate_name(output, 63)?;
             if !matches!(
-                q.result_schema[find(output)?].source_type.as_str(),
+                query.result_schema[column_index(output)?]
+                    .source_type
+                    .as_str(),
                 "timestamp" | "timestamptz"
             ) {
                 return Err(Error::Config);
@@ -250,35 +271,40 @@ impl PostgreSqlReceiverConfig {
             },
         };
         let common = CompiledQuery::compile(
-            q.statement.clone(),
+            query.statement.clone(),
             PollingConfig {
-                interval: q.interval,
-                timeout: Duration::from_secs(30),
-                max_rows_per_poll: 1000,
-                fetch_size_rows: 300,
-                max_batch_bytes: 8 * 1024 * 1024,
-                catch_up: CatchUpConfig::default(),
+                interval: query.interval,
+                timeout: OPERATION_TIMEOUT,
+                max_rows_per_poll: MAX_PAGE_ROWS,
+                fetch_size_rows: query.fetch_size_rows,
+                max_batch_bytes: MAX_BATCH_BYTES,
+                catch_up: query.catch_up,
             },
             &watermark,
             &checkpoint,
             OutputConfig {
-                timestamp_column: q.output.timestamp_column.clone(),
+                timestamp_column: query.output.timestamp_column.clone(),
                 validation_columns: vec![],
             },
         )
         .map_err(|_| Error::Config)?;
-        let plan = Plan::compile(&common, &q.result_schema, ts, tie)?;
+        let plan = Plan::compile(
+            &common,
+            &query.result_schema,
+            timestamp_index,
+            tie_breaker_index,
+        )?;
         let identity = serde_json::to_vec(&(
             "postgresql/v3",
             "postgresql",
             &self.connection.host,
             self.connection.port,
             &self.connection.database,
-            &q.statement,
+            &query.statement,
             "named-parameters/v2",
             &self.watermark,
-            &q.output,
-            &q.result_schema,
+            &query.output,
+            &query.result_schema,
             "UTC/microseconds/native-v2",
         ))
         .map_err(|_| Error::Config)?;
