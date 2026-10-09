@@ -47,8 +47,6 @@ enum RecoveryError {
     Transient,
     #[error("test terminal database failure")]
     Permanent,
-    #[error("test query timeout")]
-    Timeout,
 }
 
 #[derive(Clone)]
@@ -120,11 +118,7 @@ impl DriverAdapter for RecoveryAdapter {
     }
 
     fn is_retryable(error: &Self::Error) -> bool {
-        matches!(error, RecoveryError::Transient | RecoveryError::Timeout)
-    }
-
-    fn retry_at_next_interval(error: &Self::Error) -> bool {
-        matches!(error, RecoveryError::Timeout)
+        matches!(error, RecoveryError::Transient)
     }
 
     async fn reconnect(&mut self, _query: &CompiledQuery) -> Result<(), Self::Error> {
@@ -172,39 +166,10 @@ impl DriverAdapter for RecoveryAdapter {
 
     fn classify_error(error: &Self::Error) -> ReceiverErrorKind {
         match error {
-            RecoveryError::Transient | RecoveryError::Timeout => ReceiverErrorKind::Transport,
+            RecoveryError::Transient => ReceiverErrorKind::Transport,
             RecoveryError::Permanent => ReceiverErrorKind::Configuration,
         }
     }
-}
-
-/// Scenario: Repeated query timeouts alternate with connection failures.
-/// Guarantees: Every timeout waits the configured interval while availability backoff retains its independent capped schedule.
-#[test]
-fn query_timeouts_wait_interval_without_escalating_availability_backoff() {
-    let now = Instant::now();
-    let interval = Duration::from_secs(90);
-    let mut retry = DatabaseRetry::default();
-    for _ in 0..3 {
-        assert_eq!(
-            retry.schedule_error::<RecoveryAdapter>(now, &RecoveryError::Timeout, interval),
-            interval
-        );
-        assert_eq!(retry.retry_at, Some(now + interval));
-    }
-    assert_eq!(
-        retry.schedule_error::<RecoveryAdapter>(now, &RecoveryError::Transient, interval),
-        RETRY_INITIAL
-    );
-    assert_eq!(
-        retry.schedule_error::<RecoveryAdapter>(now, &RecoveryError::Timeout, interval),
-        interval
-    );
-    assert_eq!(
-        retry.schedule_error::<RecoveryAdapter>(now, &RecoveryError::Transient, interval),
-        RETRY_INITIAL * 2
-    );
-    assert_eq!(retry.failures, 6);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

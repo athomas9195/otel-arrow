@@ -230,7 +230,7 @@ macro_rules! postgresql_module_tests {
             use super::*;
 
             /// Scenario: PostgreSQL reports overload, transaction conflicts, timeout, or permanent failures.
-            /// Guarantees: Transient SQLSTATEs retry, only timeouts wait an interval, and auth/schema errors stay terminal.
+            /// Guarantees: Transient SQLSTATEs and timeouts retry through the shared policy; auth/schema errors stay terminal.
             #[test]
             fn sqlstate_retry_policy() {
                 for code in [
@@ -239,12 +239,10 @@ macro_rules! postgresql_module_tests {
                     let error = sqlstate(code);
                     assert_eq!(error, Error::Unavailable);
                     assert!(PostgreSqlAdapter::is_retryable(&error));
-                    assert!(!PostgreSqlAdapter::retry_at_next_interval(&error));
                 }
                 let timeout = sqlstate("57014");
                 assert_eq!(timeout, Error::Timeout);
                 assert!(PostgreSqlAdapter::is_retryable(&timeout));
-                assert!(PostgreSqlAdapter::retry_at_next_interval(&timeout));
                 for code in ["28P01", "42501", "42P01", "23505", "53200", "XX000"] {
                     let error = sqlstate(code);
                     assert_eq!(error, Error::Database);

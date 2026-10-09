@@ -70,13 +70,6 @@ pub trait DriverAdapter {
     /// indefinitely with bounded backoff; it does not restart the pipeline.
     fn is_retryable(error: &Self::Error) -> bool;
 
-    /// Returns whether a retryable failure waits a full collection interval
-    /// instead of availability backoff. Adapters can use this for query timeouts
-    /// to avoid immediately repeating expensive work on an overloaded source.
-    fn retry_at_next_interval(_error: &Self::Error) -> bool {
-        false
-    }
-
     /// Replaces failed connection/session state in one bounded, cancellable attempt.
     ///
     /// The controller calls `begin_operation` first, then this method, then

@@ -213,9 +213,9 @@ With 1,000-row pages, the default page budget allows at most 32,000 rows per
 cycle; byte limits, elapsed time, or backpressure can reduce that number.
 Both catch-up settings can be adjusted without invalidating checkpoints.
 
-Confirmed query timeouts wait a full configured collection interval before
-retrying. Temporary connection-slot exhaustion, database unavailability,
-deadlocks, and serialization failures use capped availability backoff.
+Confirmed query timeouts, temporary connection-slot exhaustion, database
+unavailability, deadlocks, and serialization failures use the shared capped
+backoff: 1, 2, 4, 8, 16, then up to 30 seconds between retries.
 Broken-pipe connection failures also retry after cleanup. Authentication,
 permission, invalid-data, and unconfirmed-cleanup errors remain
 terminal.

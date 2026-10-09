@@ -169,9 +169,6 @@ impl DriverAdapter for PostgreSqlAdapter {
             Error::Unavailable | Error::Cancelled | Error::Timeout
         )
     }
-    fn retry_at_next_interval(error: &Error) -> bool {
-        matches!(error, Error::Timeout)
-    }
     async fn reconnect(&mut self, _: &CompiledQuery) -> Result<()> {
         match self.request(Action::Reconnect).await? {
             Reply::Done => Ok(()),
