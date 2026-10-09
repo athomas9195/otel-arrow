@@ -1,8 +1,8 @@
 type: postgresql
 status:
   class: receiver
-  stability:
-    development: [logs]
   codeowners:
     active:
-      - lquerel
+      - athomas9195
+      - bendu
+      - juanjosalco
