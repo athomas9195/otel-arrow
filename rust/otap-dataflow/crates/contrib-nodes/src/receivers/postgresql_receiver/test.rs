@@ -317,43 +317,54 @@ use super::{
     adapter::Error, adapter::Operation, config::PostgreSqlReceiverConfig as Config,
     query::compile_parameters, value as convert,
 };
+use otel_arrow_dfe_engine::capability::{
+    CapabilityError, CapabilityErrorSource,
+    auth::{
+        BasicAuthCredential,
+        basic_auth_provider::{
+            BasicAuthCredentialStream, BasicAuthProvider as BasicAuthCapability,
+        },
+    },
+};
+use otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAuthProvider;
 use otel_arrow_dfe_scraper::database::{CellValue, DatabaseSystem, DriverAdapter};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_postgres::types::Type;
 
-struct FixedCredentials;
+enum TestCredentials {
+    Fixed,
+    Pending,
+    Failed,
+}
+
+fn fixed_credential() -> BasicAuthCredential {
+    BasicAuthCredential::new("reader", "password").expect("fixture")
+}
 
 #[async_trait::async_trait(?Send)]
-impl otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAuthProvider
-    for FixedCredentials
-{
-    async fn get_credential(
-        &self,
-    ) -> Result<
-        otel_arrow_dfe_engine::capability::auth::BasicAuthCredential,
-        otel_arrow_dfe_engine::capability::CapabilityError,
-    > {
-        Ok(
-            otel_arrow_dfe_engine::capability::auth::BasicAuthCredential::new("reader", "password")
-                .expect("fixture"),
-        )
+impl BasicAuthProvider for TestCredentials {
+    async fn get_credential(&self) -> Result<BasicAuthCredential, CapabilityError> {
+        match self {
+            Self::Fixed => Ok(fixed_credential()),
+            Self::Pending => futures::future::pending().await,
+            Self::Failed => Err(CapabilityErrorSource::<BasicAuthCapability>::new(
+                "PRIVATE_PROVIDER".into(),
+            )
+            .error("PRIVATE_PASSWORD")),
+        }
     }
 
-    fn credential_stream(
-        &self,
-    ) -> otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthCredentialStream
-    {
-        Box::pin(futures::stream::iter([
-            otel_arrow_dfe_engine::capability::auth::BasicAuthCredential::new("reader", "password")
-                .expect("fixture"),
-        ]))
+    fn credential_stream(&self) -> BasicAuthCredentialStream {
+        match self {
+            Self::Fixed => Box::pin(futures::stream::iter([fixed_credential()])),
+            Self::Pending | Self::Failed => Box::pin(futures::stream::pending()),
+        }
     }
 }
 
-pub(super) fn test_provider()
--> Box<dyn otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAuthProvider> {
-    Box::new(FixedCredentials)
+pub(super) fn test_provider() -> Box<dyn BasicAuthProvider> {
+    Box::new(TestCredentials::Fixed)
 }
 
 const KEY: &str =
@@ -908,41 +919,33 @@ fn cursor_configuration_requires_iso_utc() {
     }
 }
 
-/// Scenario: PostgreSQL's shipped console and OTLP pipelines obtain both credentials through the shared provider.
-/// Guarantees: Both examples reference username/password files and preserve the required capability binding.
+/// Scenario: PostgreSQL's console example obtains both credentials through the shared provider.
+/// Guarantees: The example references username/password files and preserves the required capability binding.
 #[test]
-fn examples_use_shared_file_credentials() {
-    for (source, pipeline) in [
-        (
-            include_str!("../../../../../configs/postgresql-console.yaml"),
-            "/groups/default/pipelines/main",
-        ),
-        (
-            include_str!("../../../../../configs/postgresql-otlp.yaml"),
-            "/groups/database/pipelines/pg_fixture",
-        ),
-    ] {
-        let value: Value = serde_yaml::from_str(source).expect("example YAML");
-        let pipeline = value.pointer(pipeline).expect("pipeline");
-        let provider = &pipeline["extensions"]["pg-credentials"];
-        assert_eq!(
-            provider["type"],
-            "urn:otel:extension:flat_file_user_pass_auth"
-        );
-        assert!(provider["config"].get("username").is_none());
-        assert_eq!(
-            provider["config"]["username_file"],
-            "${env:PG_USERNAME_FILE:-/run/secrets/postgresql/username}"
-        );
-        assert_eq!(
-            provider["config"]["password_secret_file"],
-            "${env:PG_PASSWORD_FILE:-/run/secrets/postgresql/password}"
-        );
-        assert_eq!(
-            pipeline["nodes"]["pg"]["capabilities"]["basic_auth_provider"],
-            "pg-credentials"
-        );
-    }
+fn console_example_uses_shared_file_credentials() {
+    let value: Value = serde_yaml::from_str(include_str!(
+        "../../../../../configs/postgresql-console.yaml"
+    ))
+    .expect("example YAML");
+    let pipeline = &value["groups"]["default"]["pipelines"]["main"];
+    let provider = &pipeline["extensions"]["pg-credentials"];
+    assert_eq!(
+        provider["type"],
+        "urn:otel:extension:flat_file_user_pass_auth"
+    );
+    assert!(provider["config"].get("username").is_none());
+    assert_eq!(
+        provider["config"]["username_file"],
+        "${env:PG_USERNAME_FILE:-/run/secrets/postgresql/username}"
+    );
+    assert_eq!(
+        provider["config"]["password_secret_file"],
+        "${env:PG_PASSWORD_FILE:-/run/secrets/postgresql/password}"
+    );
+    assert_eq!(
+        pipeline["nodes"]["pg"]["capabilities"]["basic_auth_provider"],
+        "pg-credentials"
+    );
 }
 
 /// Scenario: Operators add unsupported fields or omit required lower-bound and schema information.
@@ -1173,11 +1176,8 @@ fn redacted_errors() {
 /// Guarantees: Exit is acknowledged, the thread is joined, and repeated shutdown is idempotent.
 #[tokio::test]
 async fn disconnected_worker_shutdown() {
-    let mut adapter = super::adapter::PostgreSqlAdapter::new(
-        validate(&config(&sql(KEY))).expect("valid"),
-        test_provider(),
-    )
-    .expect("worker");
+    let mut adapter =
+        super::adapter::PostgreSqlAdapter::new(test_validated(), test_provider()).expect("worker");
     tokio::time::timeout(std::time::Duration::from_secs(2), adapter.shutdown())
         .await
         .expect("bounded shutdown")
@@ -1186,38 +1186,15 @@ async fn disconnected_worker_shutdown() {
     assert!(adapter.begin_operation().is_err());
 }
 
-struct PendingCredentials;
-
-#[async_trait::async_trait(?Send)]
-impl otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAuthProvider
-    for PendingCredentials
-{
-    async fn get_credential(
-        &self,
-    ) -> Result<
-        otel_arrow_dfe_engine::capability::auth::BasicAuthCredential,
-        otel_arrow_dfe_engine::capability::CapabilityError,
-    > {
-        futures::future::pending().await
-    }
-
-    fn credential_stream(
-        &self,
-    ) -> otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthCredentialStream
-    {
-        Box::pin(futures::stream::pending())
-    }
-}
-
 /// Scenario: A provider waits indefinitely before the first database connection and shutdown cancels its operation.
 /// Guarantees: The credential wait ends promptly and the idle worker can be joined without opening a connection.
 #[tokio::test]
 async fn provider_wait_is_cancellable() {
     use otel_arrow_dfe_scraper::database::DriverCancellation;
-    let validated = validate(&config(&sql(KEY))).expect("config");
+    let validated = test_validated();
     let query = validated.common.clone();
     let mut adapter =
-        super::adapter::PostgreSqlAdapter::new(validated, Box::new(PendingCredentials))
+        super::adapter::PostgreSqlAdapter::new(validated, Box::new(TestCredentials::Pending))
             .expect("worker");
     let cancellation = adapter.begin_operation().expect("operation");
     {
@@ -1239,10 +1216,10 @@ async fn provider_wait_is_cancellable() {
 /// Guarantees: The bounded acquisition wait fails explicitly rather than stalling the receiver indefinitely.
 #[tokio::test(start_paused = true)]
 async fn provider_wait_has_a_deadline() {
-    let validated = validate(&config(&sql(KEY))).expect("config");
+    let validated = test_validated();
     let query = validated.common.clone();
     let mut adapter =
-        super::adapter::PostgreSqlAdapter::new(validated, Box::new(PendingCredentials))
+        super::adapter::PostgreSqlAdapter::new(validated, Box::new(TestCredentials::Pending))
             .expect("worker");
     _ = adapter.begin_operation().expect("operation");
     assert!(matches!(
@@ -1252,41 +1229,15 @@ async fn provider_wait_has_a_deadline() {
     adapter.shutdown().await.expect("worker joined");
 }
 
-struct FailedCredentials;
-
-#[async_trait::async_trait(?Send)]
-impl otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAuthProvider
-    for FailedCredentials
-{
-    async fn get_credential(
-        &self,
-    ) -> Result<
-        otel_arrow_dfe_engine::capability::auth::BasicAuthCredential,
-        otel_arrow_dfe_engine::capability::CapabilityError,
-    > {
-        Err(otel_arrow_dfe_engine::capability::CapabilityErrorSource::<
-            otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthProvider,
-        >::new("PRIVATE_PROVIDER".into())
-        .error("PRIVATE_PASSWORD"))
-    }
-
-    fn credential_stream(
-        &self,
-    ) -> otel_arrow_dfe_engine::capability::auth::basic_auth_provider::BasicAuthCredentialStream
-    {
-        Box::pin(futures::stream::pending())
-    }
-}
-
 /// Scenario: A credential capability returns sensitive provider details in its error.
 /// Guarantees: PostgreSQL exposes only a terminal credential category with no secret text or source chain.
 #[tokio::test]
 async fn provider_errors_are_redacted() {
     use std::error::Error as _;
-    let validated = validate(&config(&sql(KEY))).expect("config");
+    let validated = test_validated();
     let query = validated.common.clone();
     let mut adapter =
-        super::adapter::PostgreSqlAdapter::new(validated, Box::new(FailedCredentials))
+        super::adapter::PostgreSqlAdapter::new(validated, Box::new(TestCredentials::Failed))
             .expect("worker");
     _ = adapter.begin_operation().expect("operation");
     let error = adapter
@@ -1349,7 +1300,7 @@ fn factory_requires_basic_auth_provider() {
 #[tokio::test]
 async fn scalar_cursor_cannot_execute_as_composite() {
     use otel_arrow_dfe_scraper::database::{Cursor, ScalarValue};
-    let validated = validate(&config(&sql(KEY))).expect("config");
+    let validated = test_validated();
     let query = validated.common.clone();
     let mut adapter =
         super::adapter::PostgreSqlAdapter::new(validated, test_provider()).expect("worker");

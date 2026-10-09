@@ -231,7 +231,6 @@ aws = [
 ]
 
 [dev-dependencies]
-tonic.workspace = true
 tempfile.workspace = true
 axum.workspace = true
 chrono.workspace = true
@@ -318,13 +317,3 @@ required-features = ["user-events"]
 name = "oracle_load_generator"
 path = "examples/oracle_load_generator.rs"
 required-features = ["oracle"]
-
-[[example]]
-name = "postgresql_load_generator"
-path = "examples/postgresql_load_generator.rs"
-required-features = ["postgresql"]
-
-[[example]]
-name = "postgresql_e2e"
-path = "examples/postgresql_e2e.rs"
-required-features = ["postgresql"]
